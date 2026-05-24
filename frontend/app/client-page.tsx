@@ -1,0 +1,911 @@
+'use client';
+
+import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { UploadForm } from '@/components/upload-form';
+import { TaskCountdown } from '@/components/task-countdown';
+import { TranscriptList } from '@/components/transcript-list';
+import {
+  clarifyTask,
+  completeTask,
+  getDashboard,
+  getMe,
+  login,
+  logout,
+  register,
+  type DashboardData,
+  type Task,
+  type User,
+} from '@/lib/api';
+
+const TOKEN_KEY = 'voice-task-token';
+const PRIORITY_OPTIONS: Array<Task['priority']> = ['low', 'medium', 'high'];
+
+type AuthMode = 'login' | 'register';
+
+type AuthFormState = {
+  username: string;
+  password: string;
+  first_name: string;
+  last_name: string;
+};
+
+type TranscriptItem = DashboardData['my_voice_messages'][number];
+
+type ReviewPrompt = {
+  id: string;
+  taskId: number;
+  taskTitle: string;
+  taskDescription: string;
+  taskPriority: Task['priority'];
+  dueDate: string | null;
+  assigneeUsername: string;
+  transcriptText: string;
+  message: string;
+  language: '' | 'ar' | 'en';
+};
+
+const initialFormState: AuthFormState = {
+  username: '',
+  password: '',
+  first_name: '',
+  last_name: '',
+};
+
+function formatDueDate(value: string | null) {
+  if (!value) {
+    return 'No due date';
+  }
+
+  return new Intl.DateTimeFormat('en', {
+    dateStyle: 'medium',
+  }).format(new Date(value));
+}
+
+function buildReviewPrompt(taskTitle: string, hasDueDate: boolean, language: '' | 'ar' | 'en') {
+  if (language === 'ar') {
+    if (!hasDueDate) {
+      return `راجع المهمة "${taskTitle}" قبل إرسالها. يمكنك تعديل أي شيء فيها، والموعد النهائي غير مذكور حاليًا إذا أردت إضافته.`;
+    }
+
+    return `راجع المهمة "${taskTitle}" قبل إرسالها. إذا كان هناك أي خطأ في التفريغ أو في تفاصيل المهمة يمكنك تعديله الآن.`;
+  }
+
+  if (!hasDueDate) {
+    return `Review the task "${taskTitle}" before sending it. You can change anything now, and the due date is currently missing if you want to add it.`;
+  }
+
+  return `Review the task "${taskTitle}" before sending it. If the transcription missed anything, you can correct it now.`;
+}
+
+function createReviewPrompts(transcripts: TranscriptItem[]) {
+  return transcripts.flatMap((transcript) =>
+    transcript.tasks
+      .filter((task) => !task.is_reviewed)
+      .map((task) => {
+        const language = (
+          transcript.detected_language === 'ar' || transcript.detected_language === 'en'
+            ? transcript.detected_language
+            : ''
+        ) as '' | 'ar' | 'en';
+
+        return {
+          id: `${transcript.id}:${task.id}`,
+          taskId: task.id,
+          taskTitle: task.title,
+          taskDescription: task.description,
+          taskPriority: task.priority,
+          dueDate: task.due_date,
+          assigneeUsername: task.assigned_to?.username || task.assigned_to_name || '',
+          transcriptText: transcript.transcript,
+          message: buildReviewPrompt(task.title, Boolean(task.due_date), language),
+          language,
+        };
+      })
+  );
+}
+
+function findMostFeminineVoice(voices: SpeechSynthesisVoice[], language: '' | 'ar' | 'en') {
+  const languagePrefix = language === 'ar' ? 'ar' : 'en';
+  const rankedVoices = voices
+    .map((voice) => {
+      const name = `${voice.name} ${voice.lang}`.toLowerCase();
+      let score = 0;
+
+      if (voice.lang.toLowerCase().startsWith(languagePrefix)) score += 6;
+      if (name.includes('female')) score += 5;
+      if (name.includes('woman')) score += 5;
+      if (name.includes('girl')) score += 5;
+      if (name.includes('samantha')) score += 4;
+      if (name.includes('victoria')) score += 4;
+      if (name.includes('zira')) score += 4;
+      if (name.includes('ava')) score += 3;
+      if (name.includes('aria')) score += 3;
+      if (name.includes('jenny')) score += 3;
+      if (name.includes('nora')) score += 3;
+      if (name.includes('alice')) score += 3;
+      if (name.includes('monica')) score += 3;
+      if (name.includes('arabic')) score += language === 'ar' ? 4 : 0;
+      if (name.includes('amira')) score += language === 'ar' ? 4 : 0;
+      if (name.includes('hala')) score += language === 'ar' ? 4 : 0;
+      if (voice.default) score += 1;
+
+      return { voice, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return rankedVoices[0]?.voice ?? null;
+}
+
+function speakPrompt(message: string, language: '' | 'ar' | 'en') {
+  if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+    return false;
+  }
+
+  const synth = window.speechSynthesis;
+  synth.cancel();
+
+  const utterance = new SpeechSynthesisUtterance(message);
+  utterance.rate = 0.95;
+  utterance.pitch = 1.15;
+
+  const selectedVoice = findMostFeminineVoice(synth.getVoices(), language);
+  if (selectedVoice) {
+    utterance.voice = selectedVoice;
+    utterance.lang = selectedVoice.lang;
+  } else if (language === 'ar') {
+    utterance.lang = 'ar-EG';
+  } else {
+    utterance.lang = 'en-US';
+  }
+
+  synth.speak(utterance);
+  return true;
+}
+
+function createRecordingFile(blob: Blob) {
+  const extension = blob.type.includes('mp4') ? 'mp4' : 'webm';
+  return new File([blob], `due-date-response-${Date.now()}.${extension}`, {
+    type: blob.type || 'audio/webm',
+  });
+}
+
+function TaskBoard({
+  tasks,
+  onTaskCompleted,
+}: {
+  tasks: Task[];
+  onTaskCompleted: (taskId: number) => Promise<void>;
+}) {
+  const [completingTaskId, setCompletingTaskId] = useState<number | null>(null);
+  const [completionError, setCompletionError] = useState('');
+
+  async function handleComplete(taskId: number) {
+    try {
+      setCompletionError('');
+      setCompletingTaskId(taskId);
+      await onTaskCompleted(taskId);
+    } catch (error) {
+      setCompletionError(error instanceof Error ? error.message : 'Could not complete the task.');
+    } finally {
+      setCompletingTaskId(null);
+    }
+  }
+
+  return (
+    <section className="listSection">
+      <div className="sectionHeader">
+        <div>
+          <p className="eyebrow">Assigned To You</p>
+          <h2>Your tasks</h2>
+        </div>
+      </div>
+
+      {tasks.length === 0 ? (
+        <p className="muted">No tasks are assigned to your username yet.</p>
+      ) : (
+        <>
+          <div className="taskBoardGrid">
+            {tasks.map((task) => (
+              <article className="taskBoardCard" key={task.id}>
+                <div className="taskTopRow">
+                  <strong>{task.title}</strong>
+                  <div className="taskMetaStack">
+                    {task.is_completed ? (
+                      <span className="status status-completed">completed</span>
+                    ) : null}
+                    <span className={`priorityTag priority-${task.priority}`}>{task.priority}</span>
+                  </div>
+                </div>
+                {task.description ? <p className="taskDescription">{task.description}</p> : null}
+                <p className="metaText">Due: {formatDueDate(task.due_date)}</p>
+                <TaskCountdown dueDate={task.due_date} />
+                <p className="metaText">
+                  Assigned from: {task.assigned_from?.username || 'Unknown'}
+                </p>
+                <p className="metaText">Voice message: {task.transcription?.original_filename}</p>
+                {task.transcription?.audio_url ? (
+                  <audio controls className="audioPlayer" src={task.transcription.audio_url}>
+                    Your browser does not support audio playback.
+                  </audio>
+                ) : null}
+                {!task.is_completed ? (
+                  <button
+                    className="primaryButton"
+                    type="button"
+                    onClick={() => void handleComplete(task.id)}
+                    disabled={completingTaskId === task.id}
+                  >
+                    {completingTaskId === task.id ? 'Saving...' : 'Done'}
+                  </button>
+                ) : task.completed_at ? (
+                  <p className="metaText">Completed {formatDueDate(task.completed_at)}</p>
+                ) : null}
+              </article>
+            ))}
+          </div>
+          {completionError ? <p className="errorText">{completionError}</p> : null}
+        </>
+      )}
+    </section>
+  );
+}
+
+type TaskReviewModalProps = {
+  prompt: ReviewPrompt;
+  token: string;
+  availableUsers: User[];
+  onSaved: () => Promise<void>;
+  onClose: () => void;
+};
+
+function TaskReviewModal({
+  prompt,
+  token,
+  availableUsers,
+  onSaved,
+  onClose,
+}: TaskReviewModalProps) {
+  const [title, setTitle] = useState(prompt.taskTitle);
+  const [description, setDescription] = useState(prompt.taskDescription);
+  const [manualDate, setManualDate] = useState(prompt.dueDate || '');
+  const [assigneeUsername, setAssigneeUsername] = useState(prompt.assigneeUsername);
+  const [priority, setPriority] = useState<Task['priority']>(prompt.taskPriority);
+  const [error, setError] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordedFile, setRecordedFile] = useState<File | null>(null);
+  const [recordedAudioUrl, setRecordedAudioUrl] = useState('');
+  const [speechSupported, setSpeechSupported] = useState(true);
+  const lastSpokenPromptIdRef = useRef('');
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+
+  useEffect(() => {
+    setTitle(prompt.taskTitle);
+    setDescription(prompt.taskDescription);
+    setManualDate(prompt.dueDate || '');
+    setAssigneeUsername(prompt.assigneeUsername);
+    setPriority(prompt.taskPriority);
+    setError('');
+    setRecordedFile(null);
+    if (recordedAudioUrl) {
+      URL.revokeObjectURL(recordedAudioUrl);
+      setRecordedAudioUrl('');
+    }
+  }, [prompt]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      setSpeechSupported(false);
+      return;
+    }
+
+    const synth = window.speechSynthesis;
+
+    const trySpeak = () => {
+      const started = speakPrompt(prompt.message, prompt.language);
+      setSpeechSupported(started);
+      if (started) {
+        lastSpokenPromptIdRef.current = prompt.id;
+      }
+    };
+
+    if (synth.getVoices().length > 0 && lastSpokenPromptIdRef.current !== prompt.id) {
+      trySpeak();
+      return () => synth.cancel();
+    }
+
+    const handleVoicesChanged = () => {
+      if (lastSpokenPromptIdRef.current !== prompt.id) {
+        trySpeak();
+      }
+    };
+
+    synth.addEventListener('voiceschanged', handleVoicesChanged);
+    return () => {
+      synth.removeEventListener('voiceschanged', handleVoicesChanged);
+      synth.cancel();
+    };
+  }, [prompt]);
+
+  useEffect(() => {
+    return () => {
+      if (recordedAudioUrl) {
+        URL.revokeObjectURL(recordedAudioUrl);
+      }
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, [recordedAudioUrl]);
+
+  function replayPrompt() {
+    const started = speakPrompt(prompt.message, prompt.language);
+    setSpeechSupported(started);
+    if (started) {
+      lastSpokenPromptIdRef.current = prompt.id;
+    }
+  }
+
+  function stopActiveStream() {
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+  }
+
+  async function startRecording() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError('This browser does not support microphone recording.');
+      return;
+    }
+
+    try {
+      setError('');
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+
+      const recorder = new MediaRecorder(stream);
+      audioChunksRef.current = [];
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = () => {
+        const mimeType = recorder.mimeType || 'audio/webm';
+        const blob = new Blob(audioChunksRef.current, { type: mimeType });
+        const file = createRecordingFile(blob);
+
+        if (recordedAudioUrl) {
+          URL.revokeObjectURL(recordedAudioUrl);
+        }
+
+        setRecordedFile(file);
+        setRecordedAudioUrl(URL.createObjectURL(blob));
+        setIsRecording(false);
+        stopActiveStream();
+      };
+
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setIsRecording(true);
+      setRecordedFile(null);
+
+      if (recordedAudioUrl) {
+        URL.revokeObjectURL(recordedAudioUrl);
+        setRecordedAudioUrl('');
+      }
+    } catch {
+      setError('Microphone access was blocked. Please allow access and try again.');
+      stopActiveStream();
+      setIsRecording(false);
+    }
+  }
+
+  function stopRecording() {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+    }
+  }
+
+  async function sendAsIs() {
+    try {
+      setIsSaving(true);
+      setError('');
+
+      const formData = new FormData();
+      formData.append('title', title);
+      formData.append('description', description);
+      formData.append('assignee_username', assigneeUsername);
+      formData.append('priority', priority);
+      if (manualDate) {
+        formData.append('due_date', manualDate);
+      }
+
+      await clarifyTask(prompt.taskId, formData, token);
+      await onSaved();
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Could not save the task update.');
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function saveManual() {
+    await sendAsIs();
+  }
+
+  async function saveRecording() {
+    if (!recordedFile) {
+      setError('Record a reply before saving.');
+      return;
+    }
+
+    try {
+      setIsSaving(true);
+      setError('');
+
+      const formData = new FormData();
+      formData.append('title', title);
+      formData.append('description', description);
+      formData.append('assignee_username', assigneeUsername);
+      formData.append('file', recordedFile);
+      formData.append('priority', priority);
+      formData.append('reference_date', new Date().toISOString().slice(0, 10));
+      if (prompt.language) {
+        formData.append('language', prompt.language);
+      }
+
+      await clarifyTask(prompt.taskId, formData, token);
+      await onSaved();
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : 'Could not save the recorded reply.');
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  return (
+    <div className="modalOverlay">
+      <section className="clarificationModal" role="dialog" aria-modal="true" aria-labelledby="due-date-title">
+        <div className="clarificationHeader">
+          <div>
+            <p className="eyebrow">{prompt.language === 'ar' ? 'مراجعة المهمة' : 'Task Review'}</p>
+            <h2 id="due-date-title">
+              {prompt.language === 'ar'
+                ? 'راجع المهمة قبل إرسالها.'
+                : 'Review the task before sending it.'}
+            </h2>
+          </div>
+          <button className="ghostButton" type="button" onClick={onClose} disabled={isSaving || isRecording}>
+            {prompt.language === 'ar' ? 'ذكرني لاحقًا' : 'Remind me later'}
+          </button>
+        </div>
+
+        <p className="clarificationPrompt">{prompt.message}</p>
+        {!speechSupported ? (
+          <p className="metaText">
+            {prompt.language === 'ar'
+              ? 'تشغيل الصوت غير متاح هنا، لذلك سيظل التنبيه ظاهرًا على الشاشة.'
+              : 'Audio playback is not available here, so the prompt stays visible on screen.'}
+          </p>
+        ) : null}
+
+        <div className="modalActionRow">
+          <button className="primaryButton" type="button" onClick={sendAsIs} disabled={isSaving || isRecording}>
+            {isSaving
+              ? prompt.language === 'ar'
+                ? 'جارٍ الإرسال...'
+                : 'Sending...'
+              : prompt.language === 'ar'
+                ? 'إرسال كما هي'
+                : 'Send as is'}
+          </button>
+          <button className="secondaryButton" type="button" onClick={replayPrompt} disabled={isSaving}>
+            {prompt.language === 'ar' ? 'إعادة تشغيل التنبيه الصوتي' : 'Replay voice prompt'}
+          </button>
+        </div>
+
+        <div className="clarificationGrid">
+          <div className="clarificationColumn">
+            <p className="taskHeading">{prompt.language === 'ar' ? 'تفاصيل المهمة' : 'Task details'}</p>
+            <label className="fieldGroup">
+              <span>{prompt.language === 'ar' ? 'عنوان المهمة' : 'Task title'}</span>
+              <input
+                className="textInput"
+                value={title}
+                onChange={(event) => setTitle(event.target.value)}
+                disabled={isSaving}
+              />
+            </label>
+            <label className="fieldGroup">
+              <span>{prompt.language === 'ar' ? 'الوصف' : 'Description'}</span>
+              <textarea
+                className="textInput textAreaInput"
+                value={description}
+                onChange={(event) => setDescription(event.target.value)}
+                disabled={isSaving}
+                rows={4}
+              />
+            </label>
+            <label className="fieldGroup">
+              <span>{prompt.language === 'ar' ? 'إرسال إلى' : 'Send to'}</span>
+              <select
+                className="textInput"
+                value={assigneeUsername}
+                onChange={(event) => setAssigneeUsername(event.target.value)}
+                disabled={isSaving}
+              >
+                <option value="">{prompt.language === 'ar' ? 'غير محدد' : 'Unassigned'}</option>
+                {availableUsers.map((userOption) => (
+                  <option key={userOption.id} value={userOption.username}>
+                    {userOption.username}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <div className="clarificationColumn">
+            <p className="taskHeading">{prompt.language === 'ar' ? 'الموعد والأولوية' : 'Timing and priority'}</p>
+        <div className="fieldGroup">
+          <span>{prompt.language === 'ar' ? 'درجة الاستعجال' : 'Urgency'}</span>
+          <select
+            className="textInput"
+            value={priority}
+            onChange={(event) => setPriority(event.target.value as Task['priority'])}
+            disabled={isSaving}
+          >
+            {PRIORITY_OPTIONS.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        </div>
+
+            <p className="taskHeading">{prompt.language === 'ar' ? 'إدخال يدوي' : 'Enter manually'}</p>
+            <label className="fieldGroup">
+              <span>{prompt.language === 'ar' ? 'الموعد النهائي' : 'Due date'}</span>
+              <input
+                className="textInput"
+                type="date"
+                value={manualDate}
+                onChange={(event) => setManualDate(event.target.value)}
+                disabled={isSaving}
+              />
+            </label>
+            <button className="primaryButton" type="button" onClick={saveManual} disabled={isSaving}>
+              {isSaving
+                ? prompt.language === 'ar'
+                  ? 'جارٍ الحفظ...'
+                  : 'Saving...'
+                : prompt.language === 'ar'
+                  ? 'حفظ التعديلات والإرسال'
+                  : 'Save changes and send'}
+            </button>
+            <p className="taskHeading">{prompt.language === 'ar' ? 'تسجيل رد' : 'Record a reply'}</p>
+            <div className="recordActions">
+              <button
+                className="secondaryButton"
+                type="button"
+                onClick={startRecording}
+                disabled={isRecording || isSaving}
+              >
+                {prompt.language === 'ar' ? 'ابدأ التسجيل' : 'Start recording'}
+              </button>
+              <button
+                className="ghostButton"
+                type="button"
+                onClick={stopRecording}
+                disabled={!isRecording || isSaving}
+              >
+                {prompt.language === 'ar' ? 'إيقاف التسجيل' : 'Stop recording'}
+              </button>
+            </div>
+            {recordedAudioUrl ? (
+              <audio controls className="audioPreview" src={recordedAudioUrl}>
+                Your browser does not support audio playback.
+              </audio>
+            ) : null}
+            <button className="primaryButton" type="button" onClick={saveRecording} disabled={isSaving}>
+              {isSaving
+                ? prompt.language === 'ar'
+                  ? 'جارٍ الحفظ...'
+                  : 'Saving...'
+                : prompt.language === 'ar'
+                  ? 'استخدام الرد المسجل ثم الإرسال'
+                  : 'Use recorded reply and send'}
+            </button>
+          </div>
+        </div>
+
+        {error ? <p className="errorText">{error}</p> : null}
+
+        <div className="clarificationTranscriptCard">
+          <p className="taskHeading">
+            {prompt.language === 'ar' ? 'النص الظاهر على الشاشة' : 'Transcription on screen'}
+          </p>
+          <div className="transcriptBody">{prompt.transcriptText}</div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+export function ClientPage() {
+  const [authMode, setAuthMode] = useState<AuthMode>('login');
+  const [formState, setFormState] = useState<AuthFormState>(initialFormState);
+  const [token, setToken] = useState('');
+  const [user, setUser] = useState<User | null>(null);
+  const [dashboard, setDashboard] = useState<DashboardData | null>(null);
+  const [authError, setAuthError] = useState('');
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [pendingReviewPrompts, setPendingReviewPrompts] = useState<ReviewPrompt[]>([]);
+  const [isClarificationDismissed, setIsClarificationDismissed] = useState(false);
+
+  useEffect(() => {
+    const storedToken = window.localStorage.getItem(TOKEN_KEY);
+    if (!storedToken) {
+      setIsLoading(false);
+      return;
+    }
+    const activeToken = storedToken;
+
+    async function loadSession() {
+      try {
+        const currentUser = await getMe(activeToken);
+        const dashboardData = await getDashboard(activeToken);
+        setToken(activeToken);
+        setUser(currentUser);
+        setDashboard(dashboardData);
+        setPendingReviewPrompts(createReviewPrompts(dashboardData.my_voice_messages));
+        setIsClarificationDismissed(false);
+      } catch {
+        window.localStorage.removeItem(TOKEN_KEY);
+        setToken('');
+        setUser(null);
+        setDashboard(null);
+        setPendingReviewPrompts([]);
+      } finally {
+        setIsLoading(false);
+      }
+    }
+
+    void loadSession();
+  }, []);
+
+  async function refreshDashboard(activeToken: string) {
+    const dashboardData = await getDashboard(activeToken);
+    setDashboard(dashboardData);
+    setUser(dashboardData.user);
+    setPendingReviewPrompts(createReviewPrompts(dashboardData.my_voice_messages));
+    setIsClarificationDismissed(false);
+  }
+
+  function updateField(field: keyof AuthFormState, value: string) {
+    setFormState((current) => ({
+      ...current,
+      [field]: value,
+    }));
+  }
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsSubmitting(true);
+    setAuthError('');
+
+    try {
+      const normalizedPayload = {
+        ...formState,
+        username: formState.username.trim().toLowerCase(),
+      };
+
+      const response =
+        authMode === 'register'
+          ? await register(normalizedPayload)
+          : await login({
+              username: normalizedPayload.username,
+              password: normalizedPayload.password,
+            });
+
+      window.localStorage.setItem(TOKEN_KEY, response.token);
+      setToken(response.token);
+      setUser(response.user);
+      setFormState(initialFormState);
+      await refreshDashboard(response.token);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : 'Authentication failed.');
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function handleLogout() {
+    if (!token) {
+      return;
+    }
+
+    try {
+      await logout(token);
+    } catch {
+      // The local session is cleared even if the token was already invalidated.
+    } finally {
+      window.localStorage.removeItem(TOKEN_KEY);
+      setToken('');
+      setUser(null);
+      setDashboard(null);
+      setPendingReviewPrompts([]);
+      setIsClarificationDismissed(false);
+    }
+  }
+
+  async function handleUploaded() {
+    if (!token) {
+      return;
+    }
+
+    await refreshDashboard(token);
+  }
+
+  async function handleTaskCompleted(taskId: number) {
+    if (!token) {
+      return;
+    }
+
+    await completeTask(taskId, token);
+    await refreshDashboard(token);
+  }
+
+  if (isLoading) {
+    return (
+      <main className="pageShell">
+        <section className="emptyState">
+          <h3>Loading dashboard</h3>
+          <p>Checking your login session and fetching your voice workspace.</p>
+        </section>
+      </main>
+    );
+  }
+
+  if (!token || !user || !dashboard) {
+    return (
+      <main className="pageShell">
+        <section className="heroSection">
+          <div className="heroCopy">
+            <p className="eyebrow">Voice To Task</p>
+            <h1>Login, assign tasks, and track each user’s voice messages.</h1>
+            <p className="heroText">
+              Create an account, sign in, upload a voice note, and let the system route tasks to
+              usernames like <strong>saif</strong> while showing who assigned each task.
+            </p>
+          </div>
+
+          <form className="uploadCard authCard" onSubmit={handleSubmit}>
+            <div className="authToggleRow">
+              <button
+                className={authMode === 'login' ? 'primaryButton' : 'ghostButton'}
+                type="button"
+                onClick={() => setAuthMode('login')}
+              >
+                Login
+              </button>
+              <button
+                className={authMode === 'register' ? 'primaryButton' : 'ghostButton'}
+                type="button"
+                onClick={() => setAuthMode('register')}
+              >
+                Register
+              </button>
+            </div>
+
+            <label className="fieldGroup">
+              <span>Username</span>
+              <input
+                className="textInput"
+                value={formState.username}
+                onChange={(event) => updateField('username', event.target.value)}
+                placeholder="saif"
+                required
+              />
+            </label>
+
+            {authMode === 'register' ? (
+              <>
+                <label className="fieldGroup">
+                  <span>First name</span>
+                  <input
+                    className="textInput"
+                    value={formState.first_name}
+                    onChange={(event) => updateField('first_name', event.target.value)}
+                    placeholder="Saif"
+                  />
+                </label>
+                <label className="fieldGroup">
+                  <span>Last name</span>
+                  <input
+                    className="textInput"
+                    value={formState.last_name}
+                    onChange={(event) => updateField('last_name', event.target.value)}
+                    placeholder="Hefny"
+                  />
+                </label>
+              </>
+            ) : null}
+
+            <label className="fieldGroup">
+              <span>Password</span>
+              <input
+                className="textInput"
+                type="password"
+                value={formState.password}
+                onChange={(event) => updateField('password', event.target.value)}
+                placeholder="Minimum 8 characters"
+                required
+              />
+            </label>
+
+            <button className="primaryButton" type="submit" disabled={isSubmitting}>
+              {isSubmitting
+                ? authMode === 'register'
+                  ? 'Creating account...'
+                  : 'Signing in...'
+                : authMode === 'register'
+                  ? 'Create account'
+                  : 'Login'}
+            </button>
+
+            {authError ? <p className="errorText">{authError}</p> : null}
+          </form>
+        </section>
+      </main>
+    );
+  }
+
+  const activePrompt =
+    isClarificationDismissed || pendingReviewPrompts.length === 0 ? null : pendingReviewPrompts[0];
+
+  return (
+    <>
+      <main className="pageShell">
+        <section className="heroSection">
+          <div className="heroCopy">
+            <p className="eyebrow">Private Workspace</p>
+            <h1>{user.first_name || user.username}, your tasks and recordings are ready.</h1>
+            <p className="heroText">
+              Upload a new voice message, assign work by mentioning usernames in the transcript, and
+              review everything routed to your account.
+            </p>
+            <div className="heroMetaRow">
+              <span className="recordBadge">Signed in as {user.username}</span>
+              <button className="ghostButton" type="button" onClick={handleLogout}>
+                Logout
+              </button>
+            </div>
+          </div>
+
+          <UploadForm token={token} onUploaded={handleUploaded} />
+        </section>
+
+        <TaskBoard tasks={dashboard.assigned_tasks} onTaskCompleted={handleTaskCompleted} />
+        <TranscriptList transcripts={dashboard.my_voice_messages} onTaskCompleted={handleTaskCompleted} />
+      </main>
+
+      {activePrompt ? (
+        <TaskReviewModal
+          prompt={activePrompt}
+          token={token}
+          availableUsers={dashboard.available_users}
+          onSaved={async () => {
+            await refreshDashboard(token);
+          }}
+          onClose={() => setIsClarificationDismissed(true)}
+        />
+      ) : null}
+    </>
+  );
+}
