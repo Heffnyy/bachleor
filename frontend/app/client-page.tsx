@@ -6,16 +6,68 @@ import { TaskCountdown } from '@/components/task-countdown';
 import { TranscriptList } from '@/components/transcript-list';
 import {
   clarifyTask,
-  completeTask,
+  getAccount,
   getDashboard,
   getMe,
   login,
   logout,
+  notifyTaskSender,
+  oversightDeleteTask,
+  parseApiError,
+  reassignTask,
   register,
+  requestAccountOtp,
+  setTaskStatus,
+  updateAccount,
+  verifyAccountOtp,
+  SELF_REGISTER_ROLES,
+  type AccountDetails,
+  type AccountUpdatePayload,
   type DashboardData,
+  type Role,
   type Task,
+  type TaskNote,
+  type TaskNoteKind,
+  type TaskNotePayload,
+  type TaskStatus,
   type User,
 } from '@/lib/api';
+
+const STATUS_LABELS: Record<TaskStatus, string> = {
+  delivered: 'Delivered',
+  in_progress: 'In progress',
+  done: 'Done',
+};
+
+const STATUS_ORDER: TaskStatus[] = ['delivered', 'in_progress', 'done'];
+
+function formatNoteTimestamp(value: string) {
+  return new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeStyle: 'short' }).format(
+    new Date(value)
+  );
+}
+
+function NoteItem({ note }: { note: TaskNote }) {
+  const label =
+    note.kind === 'problem'
+      ? 'Problem reported'
+      : note.kind === 'delay'
+        ? 'Delay requested'
+        : 'Update';
+
+  return (
+    <div className="noteItem">
+      <div className="noteItemHead">
+        <span className={`noteTag noteTag-${note.kind}`}>{label}</span>
+        <span className="metaText">{formatNoteTimestamp(note.created_at)}</span>
+      </div>
+      {note.requested_due_date ? (
+        <p className="metaText">Proposed new due date: {formatDueDate(note.requested_due_date)}</p>
+      ) : null}
+      {note.message ? <p className="taskDescription">{note.message}</p> : null}
+    </div>
+  );
+}
 
 const TOKEN_KEY = 'voice-task-token';
 const PRIORITY_OPTIONS: Array<Task['priority']> = ['low', 'medium', 'high'];
@@ -27,6 +79,9 @@ type AuthFormState = {
   password: string;
   first_name: string;
   last_name: string;
+  email: string;
+  requested_role: Role;
+  requested_manager_name: string;
 };
 
 type TranscriptItem = DashboardData['my_voice_messages'][number];
@@ -49,6 +104,9 @@ const initialFormState: AuthFormState = {
   password: '',
   first_name: '',
   last_name: '',
+  email: '',
+  requested_role: 'employee',
+  requested_manager_name: '',
 };
 
 function formatDueDate(value: string | null) {
@@ -169,28 +227,191 @@ function createRecordingFile(blob: Blob) {
   });
 }
 
-function TaskBoard({
-  tasks,
-  onTaskCompleted,
+function TaskStatusControls({
+  task,
+  token,
+  onChanged,
 }: {
-  tasks: Task[];
-  onTaskCompleted: (taskId: number) => Promise<void>;
+  task: Task;
+  token: string;
+  onChanged: () => Promise<void>;
 }) {
-  const [completingTaskId, setCompletingTaskId] = useState<number | null>(null);
-  const [completionError, setCompletionError] = useState('');
+  const [busyStatus, setBusyStatus] = useState<TaskStatus | null>(null);
+  const [error, setError] = useState('');
 
-  async function handleComplete(taskId: number) {
+  async function change(nextStatus: TaskStatus) {
+    if (nextStatus === task.status) {
+      return;
+    }
+
     try {
-      setCompletionError('');
-      setCompletingTaskId(taskId);
-      await onTaskCompleted(taskId);
-    } catch (error) {
-      setCompletionError(error instanceof Error ? error.message : 'Could not complete the task.');
+      setError('');
+      setBusyStatus(nextStatus);
+      await setTaskStatus(task.id, nextStatus, token);
+      await onChanged();
+    } catch (changeError) {
+      setError(changeError instanceof Error ? changeError.message : 'Could not update the status.');
     } finally {
-      setCompletingTaskId(null);
+      setBusyStatus(null);
     }
   }
 
+  return (
+    <div className="statusControls">
+      <span className="metaText">Update status</span>
+      <div className="statusButtonRow">
+        {STATUS_ORDER.map((option) => (
+          <button
+            key={option}
+            type="button"
+            className={`statusButton${task.status === option ? ' statusButton-active' : ''}`}
+            onClick={() => void change(option)}
+            disabled={busyStatus !== null}
+          >
+            {busyStatus === option ? '…' : STATUS_LABELS[option]}
+          </button>
+        ))}
+      </div>
+      {error ? <p className="errorText">{error}</p> : null}
+    </div>
+  );
+}
+
+function TaskNotifyForm({
+  task,
+  token,
+  onChanged,
+}: {
+  task: Task;
+  token: string;
+  onChanged: () => Promise<void>;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [kind, setKind] = useState<TaskNoteKind>('problem');
+  const [message, setMessage] = useState('');
+  const [requestedDate, setRequestedDate] = useState('');
+  const [isBusy, setIsBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [info, setInfo] = useState('');
+
+  async function send() {
+    try {
+      setIsBusy(true);
+      setError('');
+      setInfo('');
+
+      const payload: TaskNotePayload = { kind, message: message.trim() };
+      if (kind === 'delay' && requestedDate) {
+        payload.requested_due_date = requestedDate;
+      }
+
+      const response = await notifyTaskSender(task.id, payload, token);
+      setMessage('');
+      setRequestedDate('');
+      setInfo(
+        response.email_sent
+          ? 'Your update was emailed to the sender.'
+          : 'Your update was saved; the sender will see it on their dashboard.'
+      );
+      setIsOpen(false);
+      await onChanged();
+    } catch (sendError) {
+      setError(sendError instanceof Error ? sendError.message : 'Could not send your update.');
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  if (!isOpen) {
+    return (
+      <div className="notifyTrigger">
+        <button
+          type="button"
+          className="secondaryButton"
+          onClick={() => {
+            setIsOpen(true);
+            setInfo('');
+          }}
+        >
+          Report a problem / request delay
+        </button>
+        {info ? <p className="successText">{info}</p> : null}
+      </div>
+    );
+  }
+
+  return (
+    <div className="notifyForm">
+      <label className="fieldGroup">
+        <span>What do you want to tell the sender?</span>
+        <select
+          className="textInput"
+          value={kind}
+          onChange={(event) => setKind(event.target.value as TaskNoteKind)}
+          disabled={isBusy}
+        >
+          <option value="problem">I have a problem with this task</option>
+          <option value="delay">I need more time</option>
+          <option value="note">General update</option>
+        </select>
+      </label>
+
+      {kind === 'delay' ? (
+        <label className="fieldGroup">
+          <span>Proposed new due date (optional)</span>
+          <input
+            className="textInput"
+            type="date"
+            value={requestedDate}
+            onChange={(event) => setRequestedDate(event.target.value)}
+            disabled={isBusy}
+          />
+        </label>
+      ) : null}
+
+      <label className="fieldGroup">
+        <span>Message</span>
+        <textarea
+          className="textInput textAreaInput"
+          rows={3}
+          value={message}
+          onChange={(event) => setMessage(event.target.value)}
+          disabled={isBusy}
+          placeholder="Explain the problem or why you need more time"
+        />
+      </label>
+
+      {error ? <p className="errorText">{error}</p> : null}
+
+      <div className="modalActionRow">
+        <button type="button" className="primaryButton" onClick={() => void send()} disabled={isBusy}>
+          {isBusy ? 'Sending…' : 'Send to sender'}
+        </button>
+        <button
+          type="button"
+          className="ghostButton"
+          onClick={() => {
+            setIsOpen(false);
+            setError('');
+          }}
+          disabled={isBusy}
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function TaskBoard({
+  tasks,
+  token,
+  onChanged,
+}: {
+  tasks: Task[];
+  token: string;
+  onChanged: () => Promise<void>;
+}) {
   return (
     <section className="listSection">
       <div className="sectionHeader">
@@ -203,48 +424,45 @@ function TaskBoard({
       {tasks.length === 0 ? (
         <p className="muted">No tasks are assigned to your username yet.</p>
       ) : (
-        <>
-          <div className="taskBoardGrid">
-            {tasks.map((task) => (
-              <article className="taskBoardCard" key={task.id}>
-                <div className="taskTopRow">
-                  <strong>{task.title}</strong>
-                  <div className="taskMetaStack">
-                    {task.is_completed ? (
-                      <span className="status status-completed">completed</span>
-                    ) : null}
-                    <span className={`priorityTag priority-${task.priority}`}>{task.priority}</span>
-                  </div>
+        <div className="taskBoardGrid">
+          {tasks.map((task) => (
+            <article className="taskBoardCard" key={task.id}>
+              <div className="taskTopRow">
+                <strong>{task.title}</strong>
+                <div className="taskMetaStack">
+                  <span className={`status status-task-${task.status}`}>{STATUS_LABELS[task.status]}</span>
+                  <span className={`priorityTag priority-${task.priority}`}>{task.priority}</span>
                 </div>
-                {task.description ? <p className="taskDescription">{task.description}</p> : null}
-                <p className="metaText">Due: {formatDueDate(task.due_date)}</p>
-                <TaskCountdown dueDate={task.due_date} />
-                <p className="metaText">
-                  Assigned from: {task.assigned_from?.username || 'Unknown'}
-                </p>
-                <p className="metaText">Voice message: {task.transcription?.original_filename}</p>
-                {task.transcription?.audio_url ? (
-                  <audio controls className="audioPlayer" src={task.transcription.audio_url}>
-                    Your browser does not support audio playback.
-                  </audio>
-                ) : null}
-                {!task.is_completed ? (
-                  <button
-                    className="primaryButton"
-                    type="button"
-                    onClick={() => void handleComplete(task.id)}
-                    disabled={completingTaskId === task.id}
-                  >
-                    {completingTaskId === task.id ? 'Saving...' : 'Done'}
-                  </button>
-                ) : task.completed_at ? (
-                  <p className="metaText">Completed {formatDueDate(task.completed_at)}</p>
-                ) : null}
-              </article>
-            ))}
-          </div>
-          {completionError ? <p className="errorText">{completionError}</p> : null}
-        </>
+              </div>
+              {task.description ? <p className="taskDescription">{task.description}</p> : null}
+              <p className="metaText">Due: {formatDueDate(task.due_date)}</p>
+              <TaskCountdown dueDate={task.due_date} />
+              <p className="metaText">Assigned from: {task.assigned_from?.username || 'Unknown'}</p>
+              <p className="metaText">Voice message: {task.transcription?.original_filename}</p>
+              {task.transcription?.audio_url ? (
+                <audio controls className="audioPlayer" src={task.transcription.audio_url}>
+                  Your browser does not support audio playback.
+                </audio>
+              ) : null}
+
+              <TaskStatusControls task={task} token={token} onChanged={onChanged} />
+              {task.completed_at && task.status === 'done' ? (
+                <p className="metaText">Completed {formatDueDate(task.completed_at)}</p>
+              ) : null}
+
+              <TaskNotifyForm task={task} token={token} onChanged={onChanged} />
+
+              {task.notes.length > 0 ? (
+                <div className="noteThread">
+                  <p className="taskHeading">Updates you sent</p>
+                  {task.notes.map((note) => (
+                    <NoteItem key={note.id} note={note} />
+                  ))}
+                </div>
+              ) : null}
+            </article>
+          ))}
+        </div>
       )}
     </section>
   );
@@ -636,6 +854,461 @@ function TaskReviewModal({
   );
 }
 
+function extractErrorMessage(error: unknown): string {
+  const fallback = 'Something went wrong. Please try again.';
+  if (!(error instanceof Error)) {
+    return fallback;
+  }
+
+  const raw = error.message;
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed === 'string') {
+      return parsed;
+    }
+    if (parsed?.detail) {
+      return parsed.detail;
+    }
+    const firstKey = Object.keys(parsed)[0];
+    if (firstKey) {
+      const value = parsed[firstKey];
+      return Array.isArray(value) ? String(value[0]) : String(value);
+    }
+  } catch {
+    // Message was not JSON; fall through to the raw text.
+  }
+
+  return raw || fallback;
+}
+
+type AccountStep = 'view' | 'otp' | 'edit';
+
+function AccountModal({
+  token,
+  onClose,
+  onSaved,
+}: {
+  token: string;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+}) {
+  const [step, setStep] = useState<AccountStep>('view');
+  const [isLoading, setIsLoading] = useState(true);
+  const [username, setUsername] = useState('');
+  const [firstName, setFirstName] = useState('');
+  const [lastName, setLastName] = useState('');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [code, setCode] = useState('');
+  const [verificationToken, setVerificationToken] = useState('');
+  const [error, setError] = useState('');
+  const [info, setInfo] = useState('');
+  const [isBusy, setIsBusy] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+
+    async function load() {
+      try {
+        const data: AccountDetails = await getAccount(token);
+        if (!active) {
+          return;
+        }
+        setUsername(data.username);
+        setFirstName(data.first_name);
+        setLastName(data.last_name);
+        setEmail(data.email);
+      } catch (loadError) {
+        if (active) {
+          setError(extractErrorMessage(loadError));
+        }
+      } finally {
+        if (active) {
+          setIsLoading(false);
+        }
+      }
+    }
+
+    void load();
+    return () => {
+      active = false;
+    };
+  }, [token]);
+
+  async function handleRequestOtp() {
+    try {
+      setIsBusy(true);
+      setError('');
+      setInfo('');
+      const response = await requestAccountOtp(token);
+      setInfo(response.detail);
+      setCode('');
+      setStep('otp');
+    } catch (requestError) {
+      setError(extractErrorMessage(requestError));
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function handleVerify() {
+    try {
+      setIsBusy(true);
+      setError('');
+      const response = await verifyAccountOtp(code.trim(), token);
+      setVerificationToken(response.verification_token);
+      setInfo('');
+      setStep('edit');
+    } catch (verifyError) {
+      setError(extractErrorMessage(verifyError));
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function handleSave() {
+    try {
+      setIsBusy(true);
+      setError('');
+
+      const payload: AccountUpdatePayload = {
+        username: username.trim().toLowerCase(),
+        first_name: firstName.trim(),
+        last_name: lastName.trim(),
+        email: email.trim().toLowerCase(),
+      };
+      if (password) {
+        payload.password = password;
+      }
+
+      const updated = await updateAccount(payload, verificationToken, token);
+      setUsername(updated.username);
+      setFirstName(updated.first_name);
+      setLastName(updated.last_name);
+      setEmail(updated.email);
+      setPassword('');
+      setVerificationToken('');
+      setCode('');
+      setInfo('Your account details were updated.');
+      setStep('view');
+      await onSaved();
+    } catch (saveError) {
+      setError(extractErrorMessage(saveError));
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  const fieldsLocked = step !== 'edit';
+
+  return (
+    <div className="modalOverlay">
+      <section className="clarificationModal" role="dialog" aria-modal="true" aria-labelledby="account-title">
+        <div className="clarificationHeader">
+          <div>
+            <p className="eyebrow">Account</p>
+            <h2 id="account-title">Your details</h2>
+          </div>
+          <button className="ghostButton" type="button" onClick={onClose} disabled={isBusy}>
+            Close
+          </button>
+        </div>
+
+        {isLoading ? (
+          <p className="metaText">Loading your details…</p>
+        ) : (
+          <>
+            <p className="metaText">
+              {step === 'edit'
+                ? 'Identity verified. Update your details below and save.'
+                : 'Your details are locked. Verify with a code sent to your email to edit them.'}
+            </p>
+
+            <label className="fieldGroup">
+              <span>Username</span>
+              <input
+                className="textInput"
+                value={username}
+                disabled={fieldsLocked || isBusy}
+                onChange={(event) => setUsername(event.target.value)}
+              />
+            </label>
+            <label className="fieldGroup">
+              <span>First name</span>
+              <input
+                className="textInput"
+                value={firstName}
+                disabled={fieldsLocked || isBusy}
+                onChange={(event) => setFirstName(event.target.value)}
+              />
+            </label>
+            <label className="fieldGroup">
+              <span>Last name</span>
+              <input
+                className="textInput"
+                value={lastName}
+                disabled={fieldsLocked || isBusy}
+                onChange={(event) => setLastName(event.target.value)}
+              />
+            </label>
+            <label className="fieldGroup">
+              <span>Email</span>
+              <input
+                className="textInput"
+                type="email"
+                value={email}
+                disabled={fieldsLocked || isBusy}
+                onChange={(event) => setEmail(event.target.value)}
+              />
+            </label>
+
+            {step === 'edit' ? (
+              <label className="fieldGroup">
+                <span>New password (optional)</span>
+                <input
+                  className="textInput"
+                  type="password"
+                  value={password}
+                  disabled={isBusy}
+                  placeholder="Leave blank to keep your current password"
+                  onChange={(event) => setPassword(event.target.value)}
+                />
+              </label>
+            ) : null}
+
+            {step === 'otp' ? (
+              <label className="fieldGroup">
+                <span>Verification code</span>
+                <input
+                  className="textInput"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  value={code}
+                  disabled={isBusy}
+                  placeholder="6-digit code"
+                  onChange={(event) => setCode(event.target.value)}
+                />
+                <span className="metaText">Check your email for the code. It expires in 10 minutes.</span>
+              </label>
+            ) : null}
+
+            {info ? <p className="successText">{info}</p> : null}
+            {error ? <p className="errorText">{error}</p> : null}
+
+            <div className="modalActionRow">
+              {step === 'view' ? (
+                <button className="primaryButton" type="button" onClick={handleRequestOtp} disabled={isBusy}>
+                  {isBusy ? 'Sending code…' : 'Edit details'}
+                </button>
+              ) : null}
+
+              {step === 'otp' ? (
+                <>
+                  <button
+                    className="primaryButton"
+                    type="button"
+                    onClick={handleVerify}
+                    disabled={isBusy || !code.trim()}
+                  >
+                    {isBusy ? 'Verifying…' : 'Verify code'}
+                  </button>
+                  <button className="secondaryButton" type="button" onClick={handleRequestOtp} disabled={isBusy}>
+                    Resend code
+                  </button>
+                  <button
+                    className="ghostButton"
+                    type="button"
+                    onClick={() => {
+                      setStep('view');
+                      setError('');
+                      setInfo('');
+                      setCode('');
+                    }}
+                    disabled={isBusy}
+                  >
+                    Cancel
+                  </button>
+                </>
+              ) : null}
+
+              {step === 'edit' ? (
+                <button className="primaryButton" type="button" onClick={handleSave} disabled={isBusy}>
+                  {isBusy ? 'Saving…' : 'Save changes'}
+                </button>
+              ) : null}
+            </div>
+          </>
+        )}
+      </section>
+    </div>
+  );
+}
+
+// --- Oversight: a superior viewing/acting on their team's tasks ---
+
+function TeamTaskCard({
+  task,
+  token,
+  availableUsers,
+  onChanged,
+}: {
+  task: Task;
+  token: string;
+  availableUsers: User[];
+  onChanged: () => Promise<void>;
+}) {
+  const [reassignTo, setReassignTo] = useState('');
+  const [showDelete, setShowDelete] = useState(false);
+  const [reason, setReason] = useState('');
+  const [isBusy, setIsBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  async function doReassign() {
+    if (!reassignTo) {
+      return;
+    }
+    try {
+      setIsBusy(true);
+      setError('');
+      await reassignTask(task.id, reassignTo, token);
+      await onChanged();
+    } catch (reassignError) {
+      setError(parseApiError(reassignError).detail || 'Could not reassign the task.');
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function doDelete() {
+    try {
+      setIsBusy(true);
+      setError('');
+      await oversightDeleteTask(task.id, reason.trim(), token);
+      await onChanged();
+    } catch (deleteError) {
+      setError(parseApiError(deleteError).detail || 'Could not delete the task.');
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  return (
+    <article className="taskBoardCard">
+      <div className="taskTopRow">
+        <strong>{task.title}</strong>
+        <div className="taskMetaStack">
+          <span className={`status status-task-${task.status}`}>{STATUS_LABELS[task.status]}</span>
+          <span className={`priorityTag priority-${task.priority}`}>{task.priority}</span>
+        </div>
+      </div>
+      {task.description ? <p className="taskDescription">{task.description}</p> : null}
+      <p className="metaText">Due: {formatDueDate(task.due_date)}</p>
+      <p className="metaText">
+        From {task.assigned_from?.username || 'Unknown'} → to{' '}
+        {task.assigned_to?.username || task.assigned_to_name || 'Unassigned'}
+      </p>
+
+      <div className="oversightActions">
+        <label className="fieldGroup">
+          <span>Reassign to someone under you</span>
+          <div className="statusButtonRow">
+            <select
+              className="textInput"
+              value={reassignTo}
+              onChange={(event) => setReassignTo(event.target.value)}
+              disabled={isBusy}
+            >
+              <option value="">Choose a person…</option>
+              {availableUsers.map((option) => (
+                <option key={option.id} value={option.username}>
+                  {option.username}
+                  {option.role_display ? ` (${option.role_display})` : ''}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="secondaryButton"
+              onClick={() => void doReassign()}
+              disabled={isBusy || !reassignTo}
+            >
+              Reassign
+            </button>
+          </div>
+        </label>
+
+        {!showDelete ? (
+          <button type="button" className="ghostButton" onClick={() => setShowDelete(true)} disabled={isBusy}>
+            Delete task…
+          </button>
+        ) : (
+          <div className="notifyForm">
+            <label className="fieldGroup">
+              <span>Reason (emailed to the sender)</span>
+              <textarea
+                className="textInput textAreaInput"
+                rows={2}
+                value={reason}
+                onChange={(event) => setReason(event.target.value)}
+                disabled={isBusy}
+                placeholder="Why are you removing this task?"
+              />
+            </label>
+            <div className="modalActionRow">
+              <button type="button" className="secondaryButton" onClick={() => void doDelete()} disabled={isBusy}>
+                Confirm delete
+              </button>
+              <button type="button" className="ghostButton" onClick={() => setShowDelete(false)} disabled={isBusy}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {error ? <p className="errorText">{error}</p> : null}
+    </article>
+  );
+}
+
+function TeamTasksBoard({
+  tasks,
+  token,
+  availableUsers,
+  onChanged,
+}: {
+  tasks: Task[];
+  token: string;
+  availableUsers: User[];
+  onChanged: () => Promise<void>;
+}) {
+  return (
+    <section className="listSection">
+      <div className="sectionHeader">
+        <div>
+          <p className="eyebrow">Oversight</p>
+          <h2>Your team&apos;s tasks</h2>
+        </div>
+      </div>
+      <p className="muted">
+        Tasks sent and received by everyone beneath you in the chain of command. You can reassign or
+        delete any of them.
+      </p>
+      <div className="taskBoardGrid">
+        {tasks.map((task) => (
+          <TeamTaskCard
+            key={task.id}
+            task={task}
+            token={token}
+            availableUsers={availableUsers}
+            onChanged={onChanged}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
 export function ClientPage() {
   const [authMode, setAuthMode] = useState<AuthMode>('login');
   const [formState, setFormState] = useState<AuthFormState>(initialFormState);
@@ -643,10 +1316,12 @@ export function ClientPage() {
   const [user, setUser] = useState<User | null>(null);
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [authError, setAuthError] = useState('');
+  const [authNotice, setAuthNotice] = useState('');
   const [isLoading, setIsLoading] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [pendingReviewPrompts, setPendingReviewPrompts] = useState<ReviewPrompt[]>([]);
   const [isClarificationDismissed, setIsClarificationDismissed] = useState(false);
+  const [isAccountOpen, setIsAccountOpen] = useState(false);
 
   useEffect(() => {
     const storedToken = window.localStorage.getItem(TOKEN_KEY);
@@ -698,28 +1373,36 @@ export function ClientPage() {
     event.preventDefault();
     setIsSubmitting(true);
     setAuthError('');
+    setAuthNotice('');
+
+    const username = formState.username.trim().toLowerCase();
 
     try {
-      const normalizedPayload = {
-        ...formState,
-        username: formState.username.trim().toLowerCase(),
-      };
+      if (authMode === 'register') {
+        const response = await register({
+          username,
+          password: formState.password,
+          first_name: formState.first_name,
+          last_name: formState.last_name,
+          email: formState.email,
+          requested_role: formState.requested_role,
+          requested_manager_name: formState.requested_manager_name,
+        });
+        setFormState(initialFormState);
+        setAuthMode('login');
+        setAuthNotice(response.detail);
+        return;
+      }
 
-      const response =
-        authMode === 'register'
-          ? await register(normalizedPayload)
-          : await login({
-              username: normalizedPayload.username,
-              password: normalizedPayload.password,
-            });
-
+      const response = await login({ username, password: formState.password });
       window.localStorage.setItem(TOKEN_KEY, response.token);
       setToken(response.token);
       setUser(response.user);
       setFormState(initialFormState);
       await refreshDashboard(response.token);
     } catch (error) {
-      setAuthError(error instanceof Error ? error.message : 'Authentication failed.');
+      const payload = parseApiError(error);
+      setAuthError(payload.detail || 'Authentication failed.');
     } finally {
       setIsSubmitting(false);
     }
@@ -752,12 +1435,11 @@ export function ClientPage() {
     await refreshDashboard(token);
   }
 
-  async function handleTaskCompleted(taskId: number) {
+  async function handleTaskChanged() {
     if (!token) {
       return;
     }
 
-    await completeTask(taskId, token);
     await refreshDashboard(token);
   }
 
@@ -834,6 +1516,47 @@ export function ClientPage() {
                     placeholder="Hefny"
                   />
                 </label>
+                <label className="fieldGroup">
+                  <span>Email</span>
+                  <input
+                    className="textInput"
+                    type="email"
+                    value={formState.email}
+                    onChange={(event) => updateField('email', event.target.value)}
+                    placeholder="you@example.com"
+                    required
+                  />
+                  <span className="metaText">We&apos;ll email you here when a task is assigned to you.</span>
+                </label>
+                <label className="fieldGroup">
+                  <span>Role you are applying for</span>
+                  <select
+                    className="textInput"
+                    value={formState.requested_role}
+                    onChange={(event) => updateField('requested_role', event.target.value)}
+                  >
+                    {SELF_REGISTER_ROLES.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {formState.requested_role === 'outsource_staff' ? (
+                  <label className="fieldGroup">
+                    <span>Manager you will report to</span>
+                    <input
+                      className="textInput"
+                      value={formState.requested_manager_name}
+                      onChange={(event) => updateField('requested_manager_name', event.target.value)}
+                      placeholder="Their username or full name"
+                      required
+                    />
+                    <span className="metaText">
+                      OutSource staff only take tasks from this one person.
+                    </span>
+                  </label>
+                ) : null}
               </>
             ) : null}
 
@@ -859,6 +1582,7 @@ export function ClientPage() {
                   : 'Login'}
             </button>
 
+            {authNotice ? <p className="successText">{authNotice}</p> : null}
             {authError ? <p className="errorText">{authError}</p> : null}
           </form>
         </section>
@@ -881,18 +1605,46 @@ export function ClientPage() {
               review everything routed to your account.
             </p>
             <div className="heroMetaRow">
-              <span className="recordBadge">Signed in as {user.username}</span>
+              <span className="recordBadge">
+                Signed in as {user.username}
+                {dashboard.account?.role_display ? ` • ${dashboard.account.role_display}` : ''}
+              </span>
+              {dashboard.is_admin ? (
+                <a className="primaryButton" href="/admin" target="_blank" rel="noopener noreferrer">
+                  Admin{dashboard.pending_count > 0 ? ` (${dashboard.pending_count})` : ''}
+                </a>
+              ) : null}
+              <button className="ghostButton" type="button" onClick={() => setIsAccountOpen(true)}>
+                Account
+              </button>
               <button className="ghostButton" type="button" onClick={handleLogout}>
                 Logout
               </button>
             </div>
+            {dashboard.account?.manager ? (
+              <p className="metaText">
+                You report to {dashboard.account.manager.username}
+                {dashboard.account.manager.role_display
+                  ? ` (${dashboard.account.manager.role_display})`
+                  : ''}
+                .
+              </p>
+            ) : null}
           </div>
 
           <UploadForm token={token} onUploaded={handleUploaded} />
         </section>
 
-        <TaskBoard tasks={dashboard.assigned_tasks} onTaskCompleted={handleTaskCompleted} />
-        <TranscriptList transcripts={dashboard.my_voice_messages} onTaskCompleted={handleTaskCompleted} />
+        <TaskBoard tasks={dashboard.assigned_tasks} token={token} onChanged={handleTaskChanged} />
+        {dashboard.team_tasks.length > 0 ? (
+          <TeamTasksBoard
+            tasks={dashboard.team_tasks}
+            token={token}
+            availableUsers={dashboard.available_users}
+            onChanged={handleTaskChanged}
+          />
+        ) : null}
+        <TranscriptList transcripts={dashboard.my_voice_messages} />
       </main>
 
       {activePrompt ? (
@@ -904,6 +1656,16 @@ export function ClientPage() {
             await refreshDashboard(token);
           }}
           onClose={() => setIsClarificationDismissed(true)}
+        />
+      ) : null}
+
+      {isAccountOpen ? (
+        <AccountModal
+          token={token}
+          onClose={() => setIsAccountOpen(false)}
+          onSaved={async () => {
+            await refreshDashboard(token);
+          }}
         />
       ) : null}
     </>

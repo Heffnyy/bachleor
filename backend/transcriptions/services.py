@@ -3,9 +3,9 @@ from __future__ import annotations
 from decimal import Decimal
 from datetime import date, timedelta
 from pathlib import Path
+import json
 import re
 
-import requests
 from django.conf import settings
 
 
@@ -17,21 +17,47 @@ class TaskExtractorServiceError(Exception):
     pass
 
 
-def transcribe_file(file_path: Path, language: str | None = None) -> dict:
-    endpoint = f"{settings.TRANSCRIBER_SERVICE_URL.rstrip('/')}/transcribe"
-    with file_path.open('rb') as audio_file:
-        data = {}
-        if language:
-            data['language'] = language
-        response = requests.post(
-            endpoint,
-            files={'file': (file_path.name, audio_file, 'application/octet-stream')},
-            data=data,
-            timeout=180,
+def _openai_client():
+    """Build an OpenAI client from OPENAI_API_KEY, raising a clear error if unset."""
+    if not settings.OPENAI_API_KEY:
+        raise TranscriberServiceError(
+            'OPENAI_API_KEY is not set. Configure it in the environment so '
+            'transcription and task extraction can run.'
         )
-    if response.status_code >= 400:
-        raise TranscriberServiceError(response.text)
-    return response.json()
+    # Imported lazily so the app can start (e.g. for migrations) without the SDK
+    # configured, and so import errors surface as a clear service error.
+    try:
+        from openai import OpenAI
+    except ImportError as exc:  # pragma: no cover - dependency missing
+        raise TranscriberServiceError(f'openai package is not installed: {exc}')
+    return OpenAI(api_key=settings.OPENAI_API_KEY)
+
+
+def transcribe_file(file_path: Path, language: str | None = None) -> dict:
+    """Transcribe an audio file in-process via the OpenAI audio API.
+
+    Returns a dict with ``text``, ``language`` and ``duration_seconds`` keys,
+    matching what the views expect.
+    """
+    client = _openai_client()
+    try:
+        with file_path.open('rb') as audio_file:
+            kwargs = {
+                'model': settings.OPENAI_TRANSCRIBE_MODEL,
+                'file': audio_file,
+                'response_format': 'verbose_json',
+            }
+            if language:
+                kwargs['language'] = language
+            result = client.audio.transcriptions.create(**kwargs)
+    except Exception as exc:
+        raise TranscriberServiceError(str(exc)) from exc
+
+    return {
+        'text': getattr(result, 'text', '') or '',
+        'language': getattr(result, 'language', '') or '',
+        'duration_seconds': getattr(result, 'duration', None),
+    }
 
 
 def normalize_duration(value: float | int | None) -> Decimal | None:
@@ -40,19 +66,53 @@ def normalize_duration(value: float | int | None) -> Decimal | None:
     return Decimal(str(round(float(value), 2)))
 
 
+def _chat_json(system_prompt: str, user_prompt: str, error_cls: type[Exception]) -> dict:
+    """Call the OpenAI chat API and parse a JSON object response."""
+    try:
+        client = _openai_client()
+        response = client.chat.completions.create(
+            model=settings.OPENAI_CHAT_MODEL,
+            messages=[
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt},
+            ],
+            response_format={'type': 'json_object'},
+            temperature=0,
+        )
+        content = response.choices[0].message.content or '{}'
+        return json.loads(content)
+    except error_cls:
+        raise
+    except Exception as exc:
+        raise error_cls(str(exc)) from exc
+
+
 def extract_tasks(transcript: str, available_usernames: list[str] | None = None) -> list[dict]:
-    endpoint = f"{settings.TASK_EXTRACTOR_SERVICE_URL.rstrip('/')}/extract-tasks"
-    response = requests.post(
-        endpoint,
-        json={
-            'transcript': transcript,
-            'available_usernames': available_usernames or [],
-        },
-        timeout=60,
+    """Extract actionable tasks from a transcript in-process via the OpenAI API.
+
+    Returns a list of dicts with ``title``, ``description``, ``priority``,
+    ``assignee_username`` and ``due_date`` keys.
+    """
+    usernames = available_usernames or []
+    system_prompt = (
+        'You extract actionable tasks from a transcript of a spoken voice message. '
+        'The message may be in English or Arabic. '
+        'Respond ONLY with a JSON object of the form '
+        '{"tasks": [{"title": str, "description": str, "priority": "low"|"medium"|"high", '
+        '"assignee_username": str, "due_date": "YYYY-MM-DD"|null}]}. '
+        'Use an empty string for assignee_username when no person is clearly named. '
+        'Only use an assignee_username from the provided list of available usernames; '
+        'if the named person is not in the list, use an empty string. '
+        'Use null for due_date when no due date is mentioned. '
+        'If there are no actionable tasks, return {"tasks": []}.'
     )
-    if response.status_code >= 400:
-        raise TaskExtractorServiceError(response.text)
-    return response.json().get('tasks', [])
+    user_prompt = (
+        f'Available usernames: {json.dumps(usernames)}\n\n'
+        f'Transcript:\n{transcript}'
+    )
+    payload = _chat_json(system_prompt, user_prompt, TaskExtractorServiceError)
+    tasks = payload.get('tasks', [])
+    return tasks if isinstance(tasks, list) else []
 
 
 def normalize_due_date(value: str | None) -> date | None:
@@ -75,20 +135,18 @@ def normalize_due_date_text(text: str, reference_date: date) -> date | None:
     if deterministic_match is not None:
         return deterministic_match
 
-    endpoint = f"{settings.TASK_EXTRACTOR_SERVICE_URL.rstrip('/')}/normalize-due-date"
-    response = requests.post(
-        endpoint,
-        json={
-            'text': normalized_text,
-            'reference_date': reference_date.isoformat(),
-        },
-        timeout=60,
+    system_prompt = (
+        'You convert a spoken phrase (English or Arabic) into a calendar date. '
+        'You are given a reference date. '
+        'Respond ONLY with a JSON object {"due_date": "YYYY-MM-DD"|null}. '
+        'Use null if the phrase does not express a clear date.'
     )
-    if response.status_code >= 400:
-        raise TaskExtractorServiceError(response.text)
-
-    value = response.json().get('due_date')
-    return normalize_due_date(value)
+    user_prompt = (
+        f'Reference date: {reference_date.isoformat()}\n'
+        f'Phrase: {normalized_text}'
+    )
+    payload = _chat_json(system_prompt, user_prompt, TaskExtractorServiceError)
+    return normalize_due_date(payload.get('due_date'))
 
 
 def parse_relative_due_date(text: str, reference_date: date) -> date | None:

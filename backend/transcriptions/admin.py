@@ -1,5 +1,13 @@
 from django.contrib import admin
-from .models import Task, Transcription
+from .models import Task, TaskNote, Transcription, UserProfile
+
+
+@admin.register(UserProfile)
+class UserProfileAdmin(admin.ModelAdmin):
+    list_display = ('id', 'user', 'role', 'status', 'manager', 'requested_role', 'requested_manager_name')
+    search_fields = ('user__username', 'user__email', 'requested_manager_name')
+    list_filter = ('role', 'status')
+    raw_id_fields = ('user', 'manager')
 
 
 @admin.register(Transcription)
@@ -24,6 +32,13 @@ class TranscriptionAdmin(admin.ModelAdmin):
 
 @admin.register(Task)
 class TaskAdmin(admin.ModelAdmin):
-    list_display = ('id', 'title', 'priority', 'assigned_to', 'assigned_from', 'due_date', 'transcription')
+    list_display = ('id', 'title', 'priority', 'status', 'assigned_to', 'assigned_from', 'due_date', 'transcription')
     search_fields = ('title', 'description', 'assigned_to_name', 'assigned_to__username', 'assigned_from__username')
-    list_filter = ('priority', 'due_date', 'assigned_to', 'assigned_from')
+    list_filter = ('priority', 'status', 'due_date', 'assigned_to', 'assigned_from')
+
+
+@admin.register(TaskNote)
+class TaskNoteAdmin(admin.ModelAdmin):
+    list_display = ('id', 'task', 'kind', 'author', 'requested_due_date', 'created_at')
+    search_fields = ('message', 'task__title', 'author__username')
+    list_filter = ('kind', 'created_at')

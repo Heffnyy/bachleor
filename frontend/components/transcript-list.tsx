@@ -1,12 +1,16 @@
 'use client';
 
-import { useState } from 'react';
 import { TaskCountdown } from '@/components/task-countdown';
-import { type Transcript } from '@/lib/api';
+import { type TaskNote, type TaskStatus, type Transcript } from '@/lib/api';
 
 type TranscriptListProps = {
   transcripts: Transcript[];
-  onTaskCompleted?: (taskId: number) => Promise<void>;
+};
+
+const STATUS_LABELS: Record<TaskStatus, string> = {
+  delivered: 'Delivered',
+  in_progress: 'In progress',
+  done: 'Done',
 };
 
 function formatDate(value: string) {
@@ -26,26 +30,32 @@ function formatDueDate(value: string | null) {
   }).format(new Date(value));
 }
 
-export function TranscriptList({ transcripts, onTaskCompleted }: TranscriptListProps) {
-  const [completingTaskId, setCompletingTaskId] = useState<number | null>(null);
-  const [completionError, setCompletionError] = useState('');
+function ReceiverNote({ note }: { note: TaskNote }) {
+  const label =
+    note.kind === 'problem'
+      ? 'Problem reported'
+      : note.kind === 'delay'
+        ? 'Delay requested'
+        : 'Update';
+  const author = note.author?.username || 'the assignee';
 
-  async function handleComplete(taskId: number) {
-    if (!onTaskCompleted) {
-      return;
-    }
+  return (
+    <div className="noteItem">
+      <div className="noteItemHead">
+        <span className={`noteTag noteTag-${note.kind}`}>{label}</span>
+        <span className="metaText">
+          from {author} • {formatDate(note.created_at)}
+        </span>
+      </div>
+      {note.requested_due_date ? (
+        <p className="metaText">Proposed new due date: {formatDueDate(note.requested_due_date)}</p>
+      ) : null}
+      {note.message ? <p className="taskDescription">{note.message}</p> : null}
+    </div>
+  );
+}
 
-    try {
-      setCompletionError('');
-      setCompletingTaskId(taskId);
-      await onTaskCompleted(taskId);
-    } catch (error) {
-      setCompletionError(error instanceof Error ? error.message : 'Could not complete the task.');
-    } finally {
-      setCompletingTaskId(null);
-    }
-  }
-
+export function TranscriptList({ transcripts }: TranscriptListProps) {
   if (transcripts.length === 0) {
     return (
       <section className="emptyState">
@@ -89,8 +99,13 @@ export function TranscriptList({ transcripts, onTaskCompleted }: TranscriptListP
                       <div className="taskTopRow">
                         <strong>{task.title}</strong>
                         <div className="taskMetaStack">
-                          {!task.is_reviewed ? <span className="reviewTag">Pending review</span> : null}
-                          {task.is_completed ? <span className="status status-completed">completed</span> : null}
+                          {!task.is_reviewed ? (
+                            <span className="reviewTag">Pending review</span>
+                          ) : (
+                            <span className={`status status-task-${task.status}`}>
+                              {STATUS_LABELS[task.status]}
+                            </span>
+                          )}
                           <span className={`priorityTag priority-${task.priority}`}>{task.priority}</span>
                         </div>
                       </div>
@@ -108,23 +123,20 @@ export function TranscriptList({ transcripts, onTaskCompleted }: TranscriptListP
                           Your browser does not support audio playback.
                         </audio>
                       ) : null}
-                      {!task.is_completed && onTaskCompleted ? (
-                        <button
-                          className="primaryButton"
-                          type="button"
-                          onClick={() => void handleComplete(task.id)}
-                          disabled={completingTaskId === task.id}
-                        >
-                          {completingTaskId === task.id ? 'Saving...' : 'Done'}
-                        </button>
-                      ) : null}
-                      {task.is_completed && task.completed_at ? (
+                      {task.status === 'done' && task.completed_at ? (
                         <p className="metaText">Completed: {formatDueDate(task.completed_at)}</p>
+                      ) : null}
+                      {task.notes.length > 0 ? (
+                        <div className="noteThread">
+                          <p className="taskHeading">Updates from the assignee</p>
+                          {task.notes.map((note) => (
+                            <ReceiverNote key={note.id} note={note} />
+                          ))}
+                        </div>
                       ) : null}
                     </div>
                   ))}
                 </div>
-                {completionError ? <p className="errorText">{completionError}</p> : null}
               </div>
             ) : item.status === 'completed' ? (
               <div className="taskSection">
