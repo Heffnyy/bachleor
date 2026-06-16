@@ -22,3 +22,7 @@ pnpm-debug.log*
 # VS Code
 .vscode/
 .DS_Store
+
+# Database dumps (may contain user data / password hashes — never commit)
+datadump.json
+*dump*.json
