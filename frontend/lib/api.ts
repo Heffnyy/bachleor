@@ -141,6 +141,7 @@ export type DashboardData = {
   assigned_tasks: Task[];
   team_tasks: Task[];
   available_users: User[];
+  superiors: User[];
 };
 
 export type TaskClarificationResponse = {

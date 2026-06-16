@@ -34,12 +34,15 @@ import {
 } from '@/lib/api';
 
 const STATUS_LABELS: Record<TaskStatus, string> = {
-  delivered: 'Delivered',
+  delivered: 'Pending',
   in_progress: 'In progress',
   done: 'Done',
 };
 
 const STATUS_ORDER: TaskStatus[] = ['delivered', 'in_progress', 'done'];
+
+// Roles that oversee others and may delete tasks they can see.
+const TASK_DELETE_ROLES = new Set(['admin', 'manager', 'senior_team_leader', 'junior_team_leader']);
 
 function formatNoteTimestamp(value: string) {
   return new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeStyle: 'short' }).format(
@@ -1621,18 +1624,46 @@ export function ClientPage() {
                 Logout
               </button>
             </div>
-            {dashboard.account?.manager ? (
+            {dashboard.superiors.length > 0 ? (
               <p className="metaText">
-                You report to {dashboard.account.manager.username}
-                {dashboard.account.manager.role_display
-                  ? ` (${dashboard.account.manager.role_display})`
-                  : ''}
+                Your chain of command:{' '}
+                {dashboard.superiors
+                  .map(
+                    (boss) =>
+                      `${boss.username}${boss.role_display ? ` (${boss.role_display})` : ''}`
+                  )
+                  .join(' → ')}
                 .
               </p>
-            ) : null}
+            ) : (
+              <p className="metaText">You are at the top of your chain of command.</p>
+            )}
           </div>
 
           <UploadForm token={token} onUploaded={handleUploaded} />
+
+          <div className="assignableHint">
+            <p className="taskHeading">People you can assign tasks to</p>
+            {dashboard.available_users.length === 0 ? (
+              <p className="metaText">
+                You have no one below you in the chain of command, so you cannot assign tasks.
+              </p>
+            ) : (
+              <>
+                <p className="metaText">
+                  Mention these usernames in your recording to assign work to them:
+                </p>
+                <div className="assignableChips">
+                  {dashboard.available_users.map((person) => (
+                    <span className="assignableChip" key={person.id}>
+                      {person.username}
+                      {person.role_display ? ` · ${person.role_display}` : ''}
+                    </span>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
         </section>
 
         <TaskBoard tasks={dashboard.assigned_tasks} token={token} onChanged={handleTaskChanged} />
@@ -1644,7 +1675,12 @@ export function ClientPage() {
             onChanged={handleTaskChanged}
           />
         ) : null}
-        <TranscriptList transcripts={dashboard.my_voice_messages} />
+        <TranscriptList
+          transcripts={dashboard.my_voice_messages}
+          token={token}
+          canDeleteTasks={dashboard.is_admin || TASK_DELETE_ROLES.has(dashboard.account?.role ?? '')}
+          onChanged={handleTaskChanged}
+        />
       </main>
 
       {activePrompt ? (

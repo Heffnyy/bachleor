@@ -189,7 +189,7 @@ class Task(models.Model):
     STATUS_IN_PROGRESS = 'in_progress'
     STATUS_DONE = 'done'
     STATUS_CHOICES = [
-        (STATUS_DELIVERED, 'Delivered'),
+        (STATUS_DELIVERED, 'Pending'),
         (STATUS_IN_PROGRESS, 'In progress'),
         (STATUS_DONE, 'Done'),
     ]

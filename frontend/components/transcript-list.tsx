@@ -1,14 +1,26 @@
 'use client';
 
+import { useState } from 'react';
+
 import { TaskCountdown } from '@/components/task-countdown';
-import { type TaskNote, type TaskStatus, type Transcript } from '@/lib/api';
+import {
+  oversightDeleteTask,
+  parseApiError,
+  type Task,
+  type TaskNote,
+  type TaskStatus,
+  type Transcript,
+} from '@/lib/api';
 
 type TranscriptListProps = {
   transcripts: Transcript[];
+  token: string;
+  canDeleteTasks: boolean;
+  onChanged: () => Promise<void>;
 };
 
 const STATUS_LABELS: Record<TaskStatus, string> = {
-  delivered: 'Delivered',
+  delivered: 'Pending',
   in_progress: 'In progress',
   done: 'Done',
 };
@@ -55,7 +67,74 @@ function ReceiverNote({ note }: { note: TaskNote }) {
   );
 }
 
-export function TranscriptList({ transcripts }: TranscriptListProps) {
+function TaskDeleteControl({
+  task,
+  token,
+  onChanged,
+}: {
+  task: Task;
+  token: string;
+  onChanged: () => Promise<void>;
+}) {
+  const [showDelete, setShowDelete] = useState(false);
+  const [reason, setReason] = useState('');
+  const [isBusy, setIsBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  async function doDelete() {
+    try {
+      setIsBusy(true);
+      setError('');
+      await oversightDeleteTask(task.id, reason.trim(), token);
+      await onChanged();
+    } catch (deleteError) {
+      setError(parseApiError(deleteError).detail || 'Could not delete the task.');
+      setIsBusy(false);
+    }
+  }
+
+  if (!showDelete) {
+    return (
+      <div className="modalActionRow">
+        <button type="button" className="dangerButton" onClick={() => setShowDelete(true)}>
+          Delete task…
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="deleteConfirm">
+      <label className="fieldGroup">
+        <span>Reason (emailed to the assignee)</span>
+        <textarea
+          className="textInput textAreaInput"
+          rows={2}
+          value={reason}
+          onChange={(event) => setReason(event.target.value)}
+          disabled={isBusy}
+          placeholder="Why are you removing this task?"
+        />
+      </label>
+      <div className="modalActionRow">
+        <button type="button" className="dangerButton" onClick={() => void doDelete()} disabled={isBusy}>
+          {isBusy ? 'Deleting…' : 'Confirm delete'}
+        </button>
+        <button
+          type="button"
+          className="ghostButton"
+          onClick={() => setShowDelete(false)}
+          disabled={isBusy}
+        >
+          Cancel
+        </button>
+      </div>
+      {error ? <p className="errorText">{error}</p> : null}
+    </div>
+  );
+}
+
+export function TranscriptList({ transcripts, token, canDeleteTasks, onChanged }: TranscriptListProps) {
   if (transcripts.length === 0) {
     return (
       <section className="emptyState">
@@ -133,6 +212,9 @@ export function TranscriptList({ transcripts }: TranscriptListProps) {
                             <ReceiverNote key={note.id} note={note} />
                           ))}
                         </div>
+                      ) : null}
+                      {canDeleteTasks ? (
+                        <TaskDeleteControl task={task} token={token} onChanged={onChanged} />
                       ) : null}
                     </div>
                   ))}

@@ -21,6 +21,7 @@ from .hierarchy import (
     ensure_profile,
     get_assignable_users,
     get_overseen_user_ids,
+    get_superiors,
     is_admin,
 )
 from .models import AccountChangeOTP, Task, TaskNote, Transcription, UserProfile
@@ -398,6 +399,7 @@ def dashboard_view(request):
         )
 
     available_users = get_assignable_users(request.user)
+    superiors = get_superiors(request.user)
     profile = ensure_profile(request.user)
 
     return Response(
@@ -416,6 +418,7 @@ def dashboard_view(request):
             ).data,
             'team_tasks': TaskSerializer(team_tasks, many=True, context={'request': request}).data,
             'available_users': BasicUserSerializer(available_users, many=True).data,
+            'superiors': BasicUserSerializer(superiors, many=True).data,
         }
     )
 

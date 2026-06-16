@@ -66,6 +66,23 @@ def is_strict_ancestor(ancestor, user) -> bool:
     return False
 
 
+def get_superiors(user) -> list[User]:
+    """The chain of managers above `user`, nearest first (direct manager → … → top)."""
+    result: list[User] = []
+    profile = get_profile(user)
+    seen: set[int] = set()
+    while profile is not None and profile.manager_id:
+        if profile.manager_id in seen:
+            break
+        seen.add(profile.manager_id)
+        manager = User.objects.filter(id=profile.manager_id).select_related('profile').first()
+        if manager is None:
+            break
+        result.append(manager)
+        profile = get_profile(manager)
+    return result
+
+
 def can_assign(actor, target) -> bool:
     """Can `actor` assign a task to `target`?"""
     if actor is None or target is None or actor.id == target.id:
