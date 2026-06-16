@@ -28,6 +28,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'corsheaders',
+    'anymail',
     'rest_framework',
     'rest_framework.authtoken',
     'transcriptions',
@@ -137,12 +138,23 @@ EMAIL_PORT = int(os.getenv('EMAIL_PORT', '587'))
 EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'true').lower() == 'true'
 EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
+# Fail fast instead of hanging when outbound SMTP is blocked (e.g. on Railway).
+EMAIL_TIMEOUT = int(os.getenv('EMAIL_TIMEOUT', '15'))
 DEFAULT_FROM_EMAIL = os.getenv(
     'DEFAULT_FROM_EMAIL',
     EMAIL_HOST_USER or 'no-reply@voicetask.local',
 )
 
-if EMAIL_HOST and EMAIL_HOST_USER and EMAIL_HOST_PASSWORD:
+# Email delivery, in order of preference:
+#   1. Brevo HTTP API  — works where outbound SMTP is blocked (Railway). Set BREVO_API_KEY.
+#   2. SMTP            — local/dev with EMAIL_HOST + credentials.
+#   3. Console         — nothing configured; mail is printed to the server log.
+BREVO_API_KEY = os.getenv('BREVO_API_KEY', '')
+
+if BREVO_API_KEY:
+    EMAIL_BACKEND = 'anymail.backends.brevo.EmailBackend'
+    ANYMAIL = {'BREVO_API_KEY': BREVO_API_KEY}
+elif EMAIL_HOST and EMAIL_HOST_USER and EMAIL_HOST_PASSWORD:
     EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 else:
     EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
