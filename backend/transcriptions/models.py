@@ -55,6 +55,14 @@ class UserProfile(models.Model):
         (STATUS_PERMANENTLY_REJECTED, 'Permanently rejected'),
     ]
 
+    # Language a user wants to RECEIVE their tasks in, regardless of how a task was sent.
+    LANGUAGE_ENGLISH = 'en'
+    LANGUAGE_ARABIC = 'ar'
+    LANGUAGE_CHOICES = [
+        (LANGUAGE_ENGLISH, 'English'),
+        (LANGUAGE_ARABIC, 'Arabic'),
+    ]
+
     user = models.OneToOneField(
         settings.AUTH_USER_MODEL,
         related_name='profile',
@@ -71,6 +79,9 @@ class UserProfile(models.Model):
     )
     requested_manager_name = models.CharField(max_length=150, blank=True)
     status = models.CharField(max_length=32, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    preferred_language = models.CharField(
+        max_length=8, choices=LANGUAGE_CHOICES, default=LANGUAGE_ENGLISH
+    )
     rejection_reason = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

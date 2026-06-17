@@ -112,6 +112,13 @@ export type AuthResponse = {
   user: User;
 };
 
+export type PreferredLanguage = 'en' | 'ar';
+
+export const LANGUAGE_OPTIONS: { value: PreferredLanguage; label: string }[] = [
+  { value: 'en', label: 'English' },
+  { value: 'ar', label: 'Arabic' },
+];
+
 export type AccountDetails = {
   id: number;
   username: string;
@@ -121,6 +128,8 @@ export type AccountDetails = {
   role?: Role;
   role_display?: string;
   status?: UserStatus;
+  preferred_language?: PreferredLanguage;
+  preferred_language_display?: string;
   manager?: { id: number; username: string; role_display: string | null } | null;
 };
 
@@ -130,6 +139,7 @@ export type AccountUpdatePayload = {
   last_name?: string;
   email?: string;
   password?: string;
+  preferred_language?: PreferredLanguage;
 };
 
 export type DashboardData = {
@@ -169,6 +179,7 @@ export type RegisterPayload = {
   email: string;
   requested_role: Role;
   requested_manager_name?: string;
+  preferred_language?: PreferredLanguage;
 };
 
 export type RegisterResponse = {

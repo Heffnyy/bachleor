@@ -4,9 +4,12 @@ from decimal import Decimal
 from datetime import date, timedelta
 from pathlib import Path
 import json
+import logging
 import re
 
 from django.conf import settings
+
+logger = logging.getLogger(__name__)
 
 
 class TranscriberServiceError(Exception):
@@ -113,6 +116,37 @@ def extract_tasks(transcript: str, available_usernames: list[str] | None = None)
     payload = _chat_json(system_prompt, user_prompt, TaskExtractorServiceError)
     tasks = payload.get('tasks', [])
     return tasks if isinstance(tasks, list) else []
+
+
+def translate_text(text: str, target_language: str) -> str:
+    """Translate text into the target language ('en'/'ar'). Returns the original on any failure
+    so a translation problem can never break task creation."""
+    cleaned = (text or '').strip()
+    if not cleaned:
+        return text
+    target_name = {'en': 'English', 'ar': 'Arabic'}.get(target_language, target_language)
+    try:
+        client = _openai_client()
+        response = client.chat.completions.create(
+            model=settings.OPENAI_CHAT_MODEL,
+            messages=[
+                {
+                    'role': 'system',
+                    'content': (
+                        f'Translate the user message into {target_name}. Output only the '
+                        'translation, with no quotes, labels, or commentary. If it is already '
+                        f'in {target_name}, return it unchanged.'
+                    ),
+                },
+                {'role': 'user', 'content': cleaned},
+            ],
+            temperature=0,
+        )
+        translated = (response.choices[0].message.content or '').strip()
+        return translated or text
+    except Exception:
+        logger.exception('Translation to %s failed; keeping original text', target_language)
+        return text
 
 
 def normalize_due_date(value: str | None) -> date | None:

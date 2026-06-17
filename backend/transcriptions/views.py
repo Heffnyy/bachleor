@@ -83,7 +83,31 @@ from .services import (
     normalize_due_date_text,
     normalize_duration,
     transcribe_file,
+    translate_text,
 )
+
+
+def translate_task_for_assignee(task, source_language: str | None = None) -> None:
+    """Translate a task's title/description into its assignee's preferred language.
+
+    No-op when there's no assignee, or when the source language already matches the
+    preference. translate_text returns the original on any failure, so this never
+    breaks task creation.
+    """
+    assignee = task.assigned_to
+    if assignee is None:
+        return
+    profile = getattr(assignee, 'profile', None)
+    target = profile.preferred_language if profile else UserProfile.LANGUAGE_ENGLISH
+    if source_language and source_language == target:
+        return
+
+    new_title = translate_text(task.title, target)
+    new_description = translate_text(task.description, target)
+    if new_title != task.title or new_description != task.description:
+        task.title = new_title
+        task.description = new_description
+        task.save(update_fields=['title', 'description'])
 
 
 def resolve_assigned_user(raw_username: str) -> User | None:
@@ -181,6 +205,7 @@ def register_view(request):
 
     profile.requested_role = data['requested_role']
     profile.requested_manager_name = (data.get('requested_manager_name') or '').strip()
+    profile.preferred_language = data.get('preferred_language') or UserProfile.LANGUAGE_ENGLISH
     profile.role = UserProfile.ROLE_EMPLOYEE
     profile.manager = None
     profile.status = UserProfile.STATUS_PENDING
@@ -360,6 +385,7 @@ def account_update_view(request):
     changes = serializer.validated_data
 
     user = request.user
+    profile = ensure_profile(user)
     # Snapshot current values so we can report exactly what changed afterwards.
     previous = {
         'username': user.username,
@@ -367,6 +393,7 @@ def account_update_view(request):
         'last_name': user.last_name,
         'email': user.email,
     }
+    previous_language = profile.preferred_language
     password_changed = bool(changes.get('password')) and not user.check_password(changes['password'])
 
     if 'username' in changes:
@@ -381,6 +408,10 @@ def account_update_view(request):
         user.set_password(changes['password'])
     user.save()
 
+    if 'preferred_language' in changes:
+        profile.preferred_language = changes['preferred_language']
+        profile.save(update_fields=['preferred_language'])
+
     otp.is_consumed = True
     otp.save(update_fields=['is_consumed'])
 
@@ -390,6 +421,8 @@ def account_update_view(request):
         for field in ('username', 'first_name', 'last_name', 'email')
         if getattr(user, field) != previous[field]
     }
+    if profile.preferred_language != previous_language:
+        changed_fields['preferred_language'] = profile.get_preferred_language_display()
     if changed_fields or password_changed:
         send_account_updated_email(user, changed_fields, password_changed)
 
@@ -540,7 +573,7 @@ class TranscriptionViewSet(viewsets.ModelViewSet):
                         )
                     elif can_assign(request.user, assigned_user):
                         # DOWN — direct assignment (unchanged).
-                        Task.objects.create(
+                        new_task = Task.objects.create(
                             transcription=instance,
                             title=title,
                             description=description,
@@ -550,6 +583,8 @@ class TranscriptionViewSet(viewsets.ModelViewSet):
                             assigned_from=request.user,
                             due_date=due_date,
                         )
+                        # Deliver it in the assignee's preferred language.
+                        translate_task_for_assignee(new_task, source_language=instance.detected_language)
                         routing['assigned_down'].append(assigned_user.username)
                     elif is_strict_ancestor(assigned_user, request.user):
                         # UP — route into the upward-request approval flow (no Task yet).
@@ -856,6 +891,9 @@ class TaskViewSet(viewsets.ReadOnlyModelViewSet):
         task.completed_at = None
         task.save(update_fields=['assigned_to', 'assigned_to_name', 'status', 'is_completed', 'completed_at'])
 
+        # Re-deliver in the new assignee's preferred language.
+        translate_task_for_assignee(task)
+
         if task.is_reviewed:
             send_task_assignment_email(task)
 
@@ -1050,6 +1088,8 @@ class TaskAssignmentRequestViewSet(viewsets.GenericViewSet):
             # Final approval: tell the requester, and assign the new task to the target.
             send_task_request_approved_email(req)
             if req.created_task is not None:
+                # Deliver the new task in the target's preferred language.
+                translate_task_for_assignee(req.created_task)
                 send_task_assignment_email(req.created_task)
         elif req.status == TaskAssignmentRequest.STATUS_PENDING and req.current_approver_id:
             # Advanced: it's now the next approver's turn.

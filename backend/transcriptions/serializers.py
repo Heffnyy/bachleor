@@ -170,6 +170,11 @@ class RegisterSerializer(serializers.Serializer):
     email = serializers.EmailField(required=True)
     requested_role = serializers.ChoiceField(choices=[(role, role) for role in UserProfile.SELF_REGISTER_ROLES])
     requested_manager_name = serializers.CharField(required=False, allow_blank=True, max_length=150)
+    preferred_language = serializers.ChoiceField(
+        choices=UserProfile.LANGUAGE_CHOICES,
+        required=False,
+        default=UserProfile.LANGUAGE_ENGLISH,
+    )
 
     def validate_username(self, value: str) -> str:
         normalized_value = value.strip().lower()
@@ -272,11 +277,27 @@ class AccountDetailSerializer(serializers.ModelSerializer):
     role = serializers.CharField(source='profile.role', read_only=True)
     role_display = serializers.CharField(source='profile.get_role_display', read_only=True)
     status = serializers.CharField(source='profile.status', read_only=True)
+    preferred_language = serializers.CharField(source='profile.preferred_language', read_only=True)
+    preferred_language_display = serializers.CharField(
+        source='profile.get_preferred_language_display', read_only=True
+    )
     manager = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ['id', 'username', 'first_name', 'last_name', 'email', 'role', 'role_display', 'status', 'manager']
+        fields = [
+            'id',
+            'username',
+            'first_name',
+            'last_name',
+            'email',
+            'role',
+            'role_display',
+            'status',
+            'preferred_language',
+            'preferred_language_display',
+            'manager',
+        ]
 
     def get_manager(self, obj: User):
         profile = getattr(obj, 'profile', None)
@@ -297,6 +318,9 @@ class AccountUpdateSerializer(serializers.Serializer):
     last_name = serializers.CharField(required=False, allow_blank=True, max_length=150)
     email = serializers.EmailField(required=False)
     password = serializers.CharField(required=False, write_only=True, min_length=8)
+    preferred_language = serializers.ChoiceField(
+        choices=UserProfile.LANGUAGE_CHOICES, required=False
+    )
 
     def __init__(self, *args, **kwargs):
         self.instance_user = kwargs.pop('instance_user', None)

@@ -27,8 +27,10 @@ import {
   setTaskStatus,
   updateAccount,
   verifyAccountOtp,
+  LANGUAGE_OPTIONS,
   SELF_REGISTER_ROLES,
   type AccountDetails,
+  type PreferredLanguage,
   type AccountUpdatePayload,
   type DashboardData,
   type Role,
@@ -93,6 +95,7 @@ type AuthFormState = {
   email: string;
   requested_role: Role;
   requested_manager_name: string;
+  preferred_language: PreferredLanguage;
 };
 
 type TranscriptItem = DashboardData['my_voice_messages'][number];
@@ -118,6 +121,7 @@ const initialFormState: AuthFormState = {
   email: '',
   requested_role: 'employee',
   requested_manager_name: '',
+  preferred_language: 'en',
 };
 
 function formatDueDate(value: string | null) {
@@ -909,6 +913,7 @@ function AccountModal({
   const [firstName, setFirstName] = useState('');
   const [lastName, setLastName] = useState('');
   const [email, setEmail] = useState('');
+  const [preferredLanguage, setPreferredLanguage] = useState<PreferredLanguage>('en');
   const [password, setPassword] = useState('');
   const [code, setCode] = useState('');
   const [verificationToken, setVerificationToken] = useState('');
@@ -929,6 +934,7 @@ function AccountModal({
         setFirstName(data.first_name);
         setLastName(data.last_name);
         setEmail(data.email);
+        setPreferredLanguage(data.preferred_language ?? 'en');
       } catch (loadError) {
         if (active) {
           setError(extractErrorMessage(loadError));
@@ -987,6 +993,7 @@ function AccountModal({
         first_name: firstName.trim(),
         last_name: lastName.trim(),
         email: email.trim().toLowerCase(),
+        preferred_language: preferredLanguage,
       };
       if (password) {
         payload.password = password;
@@ -997,6 +1004,7 @@ function AccountModal({
       setFirstName(updated.first_name);
       setLastName(updated.last_name);
       setEmail(updated.email);
+      setPreferredLanguage(updated.preferred_language ?? 'en');
       setPassword('');
       setVerificationToken('');
       setCode('');
@@ -1071,6 +1079,21 @@ function AccountModal({
                 disabled={fieldsLocked || isBusy}
                 onChange={(event) => setEmail(event.target.value)}
               />
+            </label>
+            <label className="fieldGroup">
+              <span>Preferred language for receiving tasks</span>
+              <select
+                className="textInput"
+                value={preferredLanguage}
+                disabled={fieldsLocked || isBusy}
+                onChange={(event) => setPreferredLanguage(event.target.value as PreferredLanguage)}
+              >
+                {LANGUAGE_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
             </label>
 
             {step === 'edit' ? (
@@ -1924,6 +1947,7 @@ export function ClientPage() {
           email: formState.email,
           requested_role: formState.requested_role,
           requested_manager_name: formState.requested_manager_name,
+          preferred_language: formState.preferred_language,
         });
         setFormState(initialFormState);
         setAuthMode('login');
@@ -2094,6 +2118,24 @@ export function ClientPage() {
                     </span>
                   </label>
                 ) : null}
+                <label className="fieldGroup">
+                  <span>Preferred language for receiving tasks</span>
+                  <select
+                    className="textInput"
+                    value={formState.preferred_language}
+                    onChange={(event) => updateField('preferred_language', event.target.value)}
+                  >
+                    {LANGUAGE_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="metaText">
+                    Tasks assigned to you will be translated into this language, whatever language
+                    they were sent in.
+                  </span>
+                </label>
               </>
             ) : null}
 

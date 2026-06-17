@@ -311,8 +311,9 @@ def send_account_updated_email(user: User, changed_fields: dict, password_change
         'first_name': 'First name',
         'last_name': 'Last name',
         'email': 'Email',
+        'preferred_language': 'Preferred language',
     }
-    order = ('username', 'first_name', 'last_name', 'email')
+    order = ('username', 'first_name', 'last_name', 'email', 'preferred_language')
 
     summary = [labels[f] for f in order if f in changed_fields]
     if password_changed:
