@@ -1,12 +1,41 @@
 'use client';
 
 import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
-import { uploadAudio, type Transcript } from '@/lib/api';
+import { uploadAudio, type Transcript, type TaskRouting } from '@/lib/api';
 
 type UploadFormProps = {
   token: string;
   onUploaded: (transcript: Transcript) => void | Promise<void>;
 };
+
+// Turn the backend's routing summary into human confirmation lines.
+function routingMessages(routing: TaskRouting | undefined): string[] {
+  if (!routing) {
+    return [];
+  }
+  const lines: string[] = [];
+  for (const req of routing.upward_requests) {
+    lines.push(
+      req.current_approver
+        ? `Request sent — awaiting approval from ${req.current_approver}.`
+        : 'Request sent.'
+    );
+  }
+  if (routing.assigned_down.length > 0) {
+    lines.push(`Task assigned to ${routing.assigned_down.join(', ')}.`);
+  }
+  if (routing.unidentified.length > 0) {
+    lines.push(
+      `Couldn't identify who to assign to: ${routing.unidentified.join(', ')}. Re-record with a clearer name.`
+    );
+  }
+  if (routing.unroutable.length > 0) {
+    lines.push(
+      `Not in your chain of command, so it couldn't be routed to: ${routing.unroutable.join(', ')}.`
+    );
+  }
+  return lines;
+}
 
 const ACCEPTED_AUDIO = '.mp3,.wav,.m4a,.ogg,.webm,.mp4,.mpeg';
 const LANGUAGE_OPTIONS = [
@@ -26,6 +55,7 @@ export function UploadForm({ token, onUploaded }: UploadFormProps) {
   const [isUploading, setIsUploading] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [error, setError] = useState('');
+  const [confirmation, setConfirmation] = useState<string[]>([]);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedLanguage, setSelectedLanguage] = useState<'' | 'ar' | 'en'>('');
   const [recordedAudioUrl, setRecordedAudioUrl] = useState('');
@@ -78,6 +108,7 @@ export function UploadForm({ token, onUploaded }: UploadFormProps) {
 
     try {
       setError('');
+      setConfirmation([]);
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
@@ -140,6 +171,7 @@ export function UploadForm({ token, onUploaded }: UploadFormProps) {
     }
 
     setError('');
+    setConfirmation([]);
     setSelectedFile(file);
 
     if (recordedAudioUrl) {
@@ -173,7 +205,9 @@ export function UploadForm({ token, onUploaded }: UploadFormProps) {
     try {
       setIsUploading(true);
       setError('');
+      setConfirmation([]);
       const result = await uploadAudio(selectedFile, token, selectedLanguage);
+      setConfirmation(routingMessages(result.routing));
       await onUploaded(result);
       clearSelectedAudio();
     } catch (uploadError) {
@@ -275,6 +309,15 @@ export function UploadForm({ token, onUploaded }: UploadFormProps) {
       </button>
 
       {error ? <p className="errorText">{error}</p> : null}
+      {confirmation.length > 0 ? (
+        <div className="uploadConfirmation">
+          {confirmation.map((line, index) => (
+            <p className="successText" key={index}>
+              {line}
+            </p>
+          ))}
+        </div>
+      ) : null}
     </form>
   );
 }

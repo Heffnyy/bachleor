@@ -19,21 +19,36 @@ from .hierarchy import (
     can_assign,
     can_oversee_task,
     ensure_profile,
+    get_approver_chain,
     get_assignable_users,
     get_overseen_user_ids,
     get_superiors,
     is_admin,
+    is_strict_ancestor,
 )
-from .models import AccountChangeOTP, Task, TaskNote, Transcription, UserProfile
+from .models import (
+    AccountChangeOTP,
+    RequestPermissionError,
+    RequestStateError,
+    Task,
+    TaskAssignmentRequest,
+    TaskNote,
+    Transcription,
+    UserProfile,
+)
 from .notifications import (
     send_account_activated_email,
     send_account_deleted_email,
     send_account_otp_email,
     send_account_rejected_email,
+    send_account_updated_email,
     send_new_registration_admin_email,
     send_task_assignment_email,
     send_task_deleted_email,
     send_task_note_email,
+    send_task_request_approval_needed_email,
+    send_task_request_approved_email,
+    send_task_request_rejected_email,
     send_task_status_email,
 )
 from .serializers import (
@@ -47,8 +62,11 @@ from .serializers import (
     LoginSerializer,
     OTPRequestSerializer,
     RejectUserSerializer,
+    TaskAssignmentRequestCreateSerializer,
+    TaskAssignmentRequestSerializer,
     TaskClarificationSerializer,
     TaskNoteCreateSerializer,
+    TaskRequestRejectSerializer,
     TaskNoteSerializer,
     TaskOversightDeleteSerializer,
     TaskReassignSerializer,
@@ -342,6 +360,15 @@ def account_update_view(request):
     changes = serializer.validated_data
 
     user = request.user
+    # Snapshot current values so we can report exactly what changed afterwards.
+    previous = {
+        'username': user.username,
+        'first_name': user.first_name,
+        'last_name': user.last_name,
+        'email': user.email,
+    }
+    password_changed = bool(changes.get('password')) and not user.check_password(changes['password'])
+
     if 'username' in changes:
         user.username = changes['username']
     if 'first_name' in changes:
@@ -356,6 +383,15 @@ def account_update_view(request):
 
     otp.is_consumed = True
     otp.save(update_fields=['is_consumed'])
+
+    # Update committed — confirm by email, listing only fields that actually changed.
+    changed_fields = {
+        field: getattr(user, field)
+        for field in ('username', 'first_name', 'last_name', 'email')
+        if getattr(user, field) != previous[field]
+    }
+    if changed_fields or password_changed:
+        send_account_updated_email(user, changed_fields, password_changed)
 
     return Response({'user': AccountDetailSerializer(user).data})
 
@@ -453,6 +489,14 @@ class TranscriptionViewSet(viewsets.ModelViewSet):
             status=Transcription.STATUS_PENDING,
         )
 
+        # What happened to each extracted task, surfaced to the recording UI.
+        routing = {
+            'assigned_down': [],
+            'upward_requests': [],
+            'unidentified': [],
+            'unroutable': [],
+        }
+
         try:
             payload = transcribe_file(
                 Path(instance.original_file.path),
@@ -473,33 +517,82 @@ class TranscriptionViewSet(viewsets.ModelViewSet):
                     available_usernames=available_usernames,
                 )
                 Task.objects.filter(transcription=instance).delete()
-                blocked_assignees = []
                 for task in tasks:
                     raw_assignee = normalize_username_value(task.get('assignee_username') or '')
                     assigned_user = resolve_assigned_user(raw_assignee)
+                    title = task.get('title', '').strip() or 'Untitled task'
+                    description = task.get('description', '').strip()
+                    priority = task.get('priority', Task.PRIORITY_MEDIUM)
+                    due_date = normalize_due_date(task.get('due_date'))
 
-                    # Enforce the chain of command: you can only assign to people you may command.
-                    if assigned_user is not None and not can_assign(request.user, assigned_user):
-                        blocked_assignees.append(assigned_user.username)
-                        assigned_user = None
+                    if assigned_user is None:
+                        # Couldn't identify the spoken name — don't guess; leave it unassigned.
+                        routing['unidentified'].append(raw_assignee or '(no name detected)')
+                        Task.objects.create(
+                            transcription=instance,
+                            title=title,
+                            description=description,
+                            priority=priority,
+                            assigned_to=None,
+                            assigned_to_name=raw_assignee,
+                            assigned_from=request.user,
+                            due_date=due_date,
+                        )
+                    elif can_assign(request.user, assigned_user):
+                        # DOWN — direct assignment (unchanged).
+                        Task.objects.create(
+                            transcription=instance,
+                            title=title,
+                            description=description,
+                            priority=priority,
+                            assigned_to=assigned_user,
+                            assigned_to_name=assigned_user.username,
+                            assigned_from=request.user,
+                            due_date=due_date,
+                        )
+                        routing['assigned_down'].append(assigned_user.username)
+                    elif is_strict_ancestor(assigned_user, request.user):
+                        # UP — route into the upward-request approval flow (no Task yet).
+                        chain = get_approver_chain(request.user, assigned_user)
+                        req = TaskAssignmentRequest.objects.create(
+                            requester=request.user,
+                            target=assigned_user,
+                            title=title,
+                            description=description,
+                            priority=priority,
+                            due_date=due_date,
+                            approver_chain=[u.id for u in chain],
+                            current_approver=chain[0] if chain else assigned_user,
+                        )
+                        send_task_request_approval_needed_email(req)
+                        routing['upward_requests'].append(
+                            {
+                                'target': assigned_user.username,
+                                'current_approver': req.current_approver.username
+                                if req.current_approver
+                                else None,
+                                'title': title,
+                            }
+                        )
+                    else:
+                        # Resolved, but neither subordinate nor ancestor (peer / other branch).
+                        routing['unroutable'].append(assigned_user.username)
 
-                    Task.objects.create(
-                        transcription=instance,
-                        title=task.get('title', '').strip() or 'Untitled task',
-                        description=task.get('description', '').strip(),
-                        priority=task.get('priority', Task.PRIORITY_MEDIUM),
-                        assigned_to=assigned_user,
-                        assigned_to_name=assigned_user.username if assigned_user else raw_assignee,
-                        assigned_from=request.user,
-                        due_date=normalize_due_date(task.get('due_date')),
+                # Surface the non-success outcomes on the transcript card too.
+                messages = []
+                if routing['unidentified']:
+                    names = ', '.join(sorted(set(routing['unidentified'])))
+                    messages.append(
+                        f"Couldn't identify who to assign to for: {names}. "
+                        'Re-record with a clearer name, or assign during review.'
                     )
-
-                if blocked_assignees:
-                    names = ', '.join(sorted(set(blocked_assignees)))
-                    instance.error_message = (
-                        f'Some tasks were left unassigned because they are not under you in the '
-                        f'chain of command: {names}. Reassign them during review if needed.'
+                if routing['unroutable']:
+                    names = ', '.join(sorted(set(routing['unroutable'])))
+                    messages.append(
+                        f'Not in your chain of command, so the task could not be routed to: {names}.'
                     )
+                if messages:
+                    instance.error_message = ' '.join(messages)
         except TranscriberServiceError as exc:
             instance.status = Transcription.STATUS_FAILED
             instance.error_message = str(exc)
@@ -511,8 +604,9 @@ class TranscriptionViewSet(viewsets.ModelViewSet):
             instance.error_message = f'Unexpected error: {exc}'
 
         instance.save()
-        serializer = self.get_serializer(instance)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        data = self.get_serializer(instance).data
+        data['routing'] = routing
+        return Response(data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=['get'], permission_classes=[AllowAny])
     def health(self, request):
@@ -783,6 +877,210 @@ class TaskViewSet(viewsets.ReadOnlyModelViewSet):
         email_sent = send_task_deleted_email(task, request.user, reason)
         task.delete()
         return Response({'detail': 'Task deleted.', 'email_sent': email_sent})
+
+
+class TaskAssignmentRequestViewSet(viewsets.GenericViewSet):
+    """Requests to assign a task UP the chain of command, approved sequentially."""
+
+    serializer_class = TaskAssignmentRequestSerializer
+
+    def get_queryset(self):
+        user = self.request.user
+        return (
+            TaskAssignmentRequest.objects.filter(
+                Q(requester=user) | Q(current_approver=user) | Q(target=user)
+            )
+            .select_related('requester', 'target', 'current_approver', 'rejected_by', 'created_task')
+            .order_by('-created_at')
+        )
+
+    def list(self, request):
+        """My submitted requests (to track their status)."""
+        qs = self.get_queryset().filter(requester=request.user)
+        return Response({'requests': TaskAssignmentRequestSerializer(qs, many=True).data})
+
+    @action(detail=False, methods=['get'], url_path='awaiting-me')
+    def awaiting_me(self, request):
+        """Pending requests where it is currently my turn to approve."""
+        qs = self.get_queryset().filter(
+            current_approver=request.user, status=TaskAssignmentRequest.STATUS_PENDING
+        )
+        return Response({'requests': TaskAssignmentRequestSerializer(qs, many=True).data})
+
+    def create(self, request):
+        serializer = TaskAssignmentRequestCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        target = resolve_assigned_user(data['target_username'])
+        if target is None:
+            return Response({'detail': 'That user could not be found.'}, status=status.HTTP_404_NOT_FOUND)
+        if target.id == request.user.id:
+            return Response(
+                {'detail': 'You cannot request a task for yourself.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            chain = get_approver_chain(request.user, target)
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        req = TaskAssignmentRequest.objects.create(
+            requester=request.user,
+            target=target,
+            title=data['title'].strip(),
+            description=(data.get('description') or '').strip(),
+            priority=data.get('priority') or Task.PRIORITY_MEDIUM,
+            due_date=data.get('due_date'),
+            approver_chain=[u.id for u in chain],
+            # No intermediates (direct manager) -> the target approves it themselves.
+            current_approver=chain[0] if chain else target,
+        )
+        # Transition committed — notify the first approver (mail failure must not break this).
+        send_task_request_approval_needed_email(req)
+        return Response(
+            {'request': TaskAssignmentRequestSerializer(req).data},
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(
+        detail=False,
+        methods=['post'],
+        url_path='from-audio',
+        parser_classes=[MultiPartParser, FormParser],
+    )
+    def from_audio(self, request):
+        """Create an upward request by VOICE for an EXPLICITLY chosen target.
+
+        Transcribes the recording and extracts the task fields (the spoken assignee is
+        ignored — the target is the one picked in the form), then routes it through the
+        same upward-request flow.
+        """
+        uploaded_file = request.FILES.get('file')
+        if uploaded_file is None:
+            return Response(
+                {'detail': 'Audio file is required in the file field.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        target = resolve_assigned_user(request.data.get('target_username') or '')
+        if target is None:
+            return Response({'detail': 'That user could not be found.'}, status=status.HTTP_404_NOT_FOUND)
+        if target.id == request.user.id:
+            return Response(
+                {'detail': 'You cannot request a task for yourself.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            chain = get_approver_chain(request.user, target)
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        selected_language = (request.data.get('language') or '').strip().lower()
+        if selected_language and selected_language not in {'ar', 'en'}:
+            return Response(
+                {'detail': 'language must be one of: ar, en, or omitted.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Transcribe the recording (same engine as a normal task).
+        suffix = Path(uploaded_file.name or 'recording.webm').suffix or '.webm'
+        try:
+            with NamedTemporaryFile(delete=True, suffix=suffix) as temp_file:
+                for chunk in uploaded_file.chunks():
+                    temp_file.write(chunk)
+                temp_file.flush()
+                payload = transcribe_file(Path(temp_file.name), language=selected_language or None)
+        except TranscriberServiceError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        transcript = (payload.get('text') or '').strip()
+        if not transcript:
+            return Response(
+                {'detail': 'Could not transcribe any speech. Please record again.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Extract task fields (title/description/priority/due_date); the spoken assignee is ignored.
+        title, description, priority, due_date = transcript[:255], '', Task.PRIORITY_MEDIUM, None
+        try:
+            available_usernames = list(
+                User.objects.order_by('username').values_list('username', flat=True)
+            )
+            extracted = extract_tasks(transcript, available_usernames=available_usernames)
+            if extracted:
+                first = extracted[0]
+                title = first.get('title', '').strip() or transcript[:255]
+                description = first.get('description', '').strip()
+                priority = first.get('priority', Task.PRIORITY_MEDIUM)
+                due_date = normalize_due_date(first.get('due_date'))
+        except TaskExtractorServiceError:
+            # Fall back to the raw transcript as the title.
+            pass
+
+        req = TaskAssignmentRequest.objects.create(
+            requester=request.user,
+            target=target,
+            title=title,
+            description=description,
+            priority=priority,
+            due_date=due_date,
+            approver_chain=[u.id for u in chain],
+            current_approver=chain[0] if chain else target,
+        )
+        send_task_request_approval_needed_email(req)
+        return Response(
+            {'request': TaskAssignmentRequestSerializer(req).data, 'transcript': transcript},
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        req = self.get_object()
+        try:
+            req.approve(request.user)
+        except RequestPermissionError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        except RequestStateError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        # Transition committed — notify (mail failure must not break the approval).
+        if req.status == TaskAssignmentRequest.STATUS_APPROVED:
+            # Final approval: tell the requester, and assign the new task to the target.
+            send_task_request_approved_email(req)
+            if req.created_task is not None:
+                send_task_assignment_email(req.created_task)
+        elif req.status == TaskAssignmentRequest.STATUS_PENDING and req.current_approver_id:
+            # Advanced: it's now the next approver's turn.
+            send_task_request_approval_needed_email(req)
+        return Response({'request': TaskAssignmentRequestSerializer(req).data})
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        req = self.get_object()
+        reject_serializer = TaskRequestRejectSerializer(data=request.data)
+        reject_serializer.is_valid(raise_exception=True)
+        try:
+            req.reject(request.user, reject_serializer.validated_data.get('reason', ''))
+        except RequestPermissionError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        except RequestStateError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        # Transition committed — tell the requester it was rejected (mail failure is non-fatal).
+        send_task_request_rejected_email(req)
+        return Response({'request': TaskAssignmentRequestSerializer(req).data})
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        req = self.get_object()
+        try:
+            req.cancel(request.user)
+        except RequestPermissionError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        except RequestStateError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'request': TaskAssignmentRequestSerializer(req).data})
 
 
 # ---------------------------------------------------------------------------

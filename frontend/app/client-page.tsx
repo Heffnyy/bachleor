@@ -5,10 +5,16 @@ import { UploadForm } from '@/components/upload-form';
 import { TaskCountdown } from '@/components/task-countdown';
 import { TranscriptList } from '@/components/transcript-list';
 import {
+  approveTaskRequest,
+  cancelTaskRequest,
   clarifyTask,
+  createTaskRequest,
+  createTaskRequestFromAudio,
   getAccount,
   getDashboard,
   getMe,
+  getMyTaskRequests,
+  getRequestsAwaitingMe,
   login,
   logout,
   notifyTaskSender,
@@ -16,6 +22,7 @@ import {
   parseApiError,
   reassignTask,
   register,
+  rejectTaskRequest,
   requestAccountOtp,
   setTaskStatus,
   updateAccount,
@@ -26,6 +33,7 @@ import {
   type DashboardData,
   type Role,
   type Task,
+  type TaskAssignmentRequest,
   type TaskNote,
   type TaskNoteKind,
   type TaskNotePayload,
@@ -1312,6 +1320,513 @@ function TeamTasksBoard({
   );
 }
 
+const REQUEST_STATUS_LABELS: Record<TaskAssignmentRequest['status'], string> = {
+  pending: 'Pending',
+  approved: 'Approved',
+  rejected: 'Rejected',
+  cancelled: 'Cancelled',
+};
+
+function personLabel(person: User | null): string {
+  if (!person) {
+    return 'Unknown';
+  }
+  return [person.first_name, person.last_name].filter(Boolean).join(' ') || person.username;
+}
+
+function UpwardRequestForm({
+  superiors,
+  token,
+  onChanged,
+}: {
+  superiors: User[];
+  token: string;
+  onChanged: () => Promise<void>;
+}) {
+  const [targetUsername, setTargetUsername] = useState('');
+  const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
+  const [priority, setPriority] = useState<'low' | 'medium' | 'high'>('medium');
+  const [isBusy, setIsBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [info, setInfo] = useState('');
+
+  // Voice recording (records a request for the explicitly chosen target above).
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordedFile, setRecordedFile] = useState<File | null>(null);
+  const [recordedUrl, setRecordedUrl] = useState('');
+  const [recordingTime, setRecordingTime] = useState(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const timerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current !== null) {
+        window.clearInterval(timerRef.current);
+      }
+      if (recordedUrl) {
+        URL.revokeObjectURL(recordedUrl);
+      }
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    };
+  }, [recordedUrl]);
+
+  function formatDuration(totalSeconds: number) {
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+  }
+
+  function clearRecording() {
+    if (recordedUrl) {
+      URL.revokeObjectURL(recordedUrl);
+    }
+    setRecordedFile(null);
+    setRecordedUrl('');
+    setRecordingTime(0);
+  }
+
+  async function startRecording() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError('This browser does not support microphone recording.');
+      return;
+    }
+    try {
+      setError('');
+      setInfo('');
+      clearRecording();
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+      const recorder = new MediaRecorder(stream);
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+      recorder.onstop = () => {
+        const mimeType = recorder.mimeType || 'audio/webm';
+        const blob = new Blob(audioChunksRef.current, { type: mimeType });
+        const extension = mimeType.includes('mp4') ? 'mp4' : 'webm';
+        setRecordedFile(
+          new File([blob], `request-${Date.now()}.${extension}`, { type: mimeType })
+        );
+        setRecordedUrl(URL.createObjectURL(blob));
+        setIsRecording(false);
+        if (timerRef.current !== null) {
+          window.clearInterval(timerRef.current);
+          timerRef.current = null;
+        }
+        mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
+      };
+      mediaRecorderRef.current = recorder;
+      recorder.start();
+      setIsRecording(true);
+      setRecordingTime(0);
+      timerRef.current = window.setInterval(() => {
+        setRecordingTime((current) => current + 1);
+      }, 1000);
+    } catch {
+      setError('Microphone access was blocked. Please allow access and try again.');
+      setIsRecording(false);
+    }
+  }
+
+  function stopRecording() {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop();
+    }
+  }
+
+  function resetForm() {
+    setTargetUsername('');
+    setTitle('');
+    setDescription('');
+    setPriority('medium');
+    clearRecording();
+  }
+
+  async function submit() {
+    if (!targetUsername) {
+      setError('Pick who the task is for.');
+      return;
+    }
+    if (!recordedFile && !title.trim()) {
+      setError('Record a voice note or enter a title.');
+      return;
+    }
+    try {
+      setIsBusy(true);
+      setError('');
+      setInfo('');
+      const created = recordedFile
+        ? (await createTaskRequestFromAudio(targetUsername, recordedFile, token)).request
+        : (
+            await createTaskRequest(
+              {
+                target_username: targetUsername,
+                title: title.trim(),
+                description: description.trim(),
+                priority,
+              },
+              token
+            )
+          ).request;
+      const approver = created.current_approver;
+      const how = recordedFile ? ' (from your recording)' : '';
+      setInfo(
+        approver
+          ? `Request sent${how} — awaiting approval from ${approver.username}.`
+          : `Request sent${how}.`
+      );
+      // Reset so it's clear this is a pending request, not a completed direct assignment.
+      resetForm();
+      await onChanged();
+    } catch (submitError) {
+      setError(parseApiError(submitError).detail || 'Could not send the request.');
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  return (
+    <div className="assignableHint">
+      <p className="taskHeading">Request a task for someone above you</p>
+      <p className="metaText">
+        You can&apos;t assign tasks upward directly — pick a superior, then either record a voice
+        note or type it. Each manager between you and them approves in turn.
+      </p>
+      <label className="fieldGroup">
+        <span>Assign to (a superior)</span>
+        <select
+          className="textInput"
+          value={targetUsername}
+          onChange={(event) => setTargetUsername(event.target.value)}
+          disabled={isBusy}
+        >
+          <option value="">Select…</option>
+          {superiors.map((boss) => (
+            <option key={boss.id} value={boss.username}>
+              {boss.username}
+              {boss.role_display ? ` (${boss.role_display})` : ''}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <div className="recordPanel">
+        <div className="recordPanelHeader">
+          <strong>Record the request</strong>
+          <span className={`recordBadge${isRecording ? ' is-live' : ''}`}>
+            {isRecording ? `Recording ${formatDuration(recordingTime)}` : 'Ready'}
+          </span>
+        </div>
+        <div className="recordActions">
+          <button
+            className="secondaryButton"
+            type="button"
+            onClick={() => void startRecording()}
+            disabled={isRecording || isBusy}
+          >
+            Start recording
+          </button>
+          <button
+            className="ghostButton"
+            type="button"
+            onClick={stopRecording}
+            disabled={!isRecording || isBusy}
+          >
+            Stop recording
+          </button>
+          {recordedFile ? (
+            <button className="textButton" type="button" onClick={clearRecording} disabled={isBusy}>
+              Clear
+            </button>
+          ) : null}
+        </div>
+        {recordedUrl ? (
+          <audio controls className="audioPreview" src={recordedUrl}>
+            Your browser does not support audio playback.
+          </audio>
+        ) : null}
+      </div>
+
+      {!recordedFile ? (
+        <>
+          <label className="fieldGroup">
+            <span>Task title</span>
+            <input
+              className="textInput"
+              value={title}
+              onChange={(event) => setTitle(event.target.value)}
+              disabled={isBusy}
+            />
+          </label>
+          <label className="fieldGroup">
+            <span>Description (optional)</span>
+            <textarea
+              className="textInput textAreaInput"
+              rows={2}
+              value={description}
+              onChange={(event) => setDescription(event.target.value)}
+              disabled={isBusy}
+            />
+          </label>
+          <label className="fieldGroup">
+            <span>Priority</span>
+            <select
+              className="textInput"
+              value={priority}
+              onChange={(event) => setPriority(event.target.value as 'low' | 'medium' | 'high')}
+              disabled={isBusy}
+            >
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+            </select>
+          </label>
+        </>
+      ) : (
+        <p className="metaText">
+          Your recording will be transcribed into the task. Submit to send the request.
+        </p>
+      )}
+
+      <div className="modalActionRow">
+        <button type="button" className="secondaryButton" onClick={() => void submit()} disabled={isBusy || isRecording}>
+          {isBusy ? 'Sending…' : recordedFile ? 'Submit recorded request' : 'Submit request'}
+        </button>
+        {info ? <span className="successText">{info}</span> : null}
+      </div>
+      {error ? <p className="errorText">{error}</p> : null}
+    </div>
+  );
+}
+
+function ApprovalRequestCard({
+  req,
+  token,
+  onChanged,
+}: {
+  req: TaskAssignmentRequest;
+  token: string;
+  onChanged: () => Promise<void>;
+}) {
+  const [isBusy, setIsBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [showReject, setShowReject] = useState(false);
+  const [reason, setReason] = useState('');
+
+  async function approve() {
+    try {
+      setIsBusy(true);
+      setError('');
+      await approveTaskRequest(req.id, token);
+      await onChanged();
+    } catch (approveError) {
+      setError(parseApiError(approveError).detail || 'Could not approve this request.');
+      setIsBusy(false);
+    }
+  }
+
+  async function reject() {
+    if (!reason.trim()) {
+      setError('A reason is required to reject.');
+      return;
+    }
+    try {
+      setIsBusy(true);
+      setError('');
+      await rejectTaskRequest(req.id, reason.trim(), token);
+      await onChanged();
+    } catch (rejectError) {
+      setError(parseApiError(rejectError).detail || 'Could not reject this request.');
+      setIsBusy(false);
+    }
+  }
+
+  return (
+    <article className="taskBoardCard">
+      <div className="taskTopRow">
+        <strong>{req.title}</strong>
+        <span className={`priorityTag priority-${req.priority}`}>{req.priority}</span>
+      </div>
+      <p className="metaText">
+        <strong>{personLabel(req.requester)}</strong> requests a task be assigned to{' '}
+        <strong>{personLabel(req.target)}</strong>.
+      </p>
+      {req.description ? <p className="taskDescription">{req.description}</p> : null}
+      {req.due_date ? <p className="metaText">Due: {formatDueDate(req.due_date)}</p> : null}
+
+      {!showReject ? (
+        <div className="modalActionRow">
+          <button type="button" className="primaryButton" onClick={() => void approve()} disabled={isBusy}>
+            {isBusy ? '…' : 'Approve'}
+          </button>
+          <button
+            type="button"
+            className="dangerButton"
+            onClick={() => {
+              setShowReject(true);
+              setError('');
+            }}
+            disabled={isBusy}
+          >
+            Reject
+          </button>
+        </div>
+      ) : (
+        <div className="deleteConfirm">
+          <label className="fieldGroup">
+            <span>Reason for rejecting (required — sent to the requester)</span>
+            <textarea
+              className="textInput textAreaInput"
+              rows={2}
+              value={reason}
+              onChange={(event) => setReason(event.target.value)}
+              disabled={isBusy}
+            />
+          </label>
+          <div className="modalActionRow">
+            <button
+              type="button"
+              className="dangerButton"
+              onClick={() => void reject()}
+              disabled={isBusy || !reason.trim()}
+            >
+              {isBusy ? 'Rejecting…' : 'Confirm reject'}
+            </button>
+            <button
+              type="button"
+              className="ghostButton"
+              onClick={() => setShowReject(false)}
+              disabled={isBusy}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+      {error ? <p className="errorText">{error}</p> : null}
+    </article>
+  );
+}
+
+function ApprovalRequestsBoard({
+  requests,
+  token,
+  onChanged,
+}: {
+  requests: TaskAssignmentRequest[];
+  token: string;
+  onChanged: () => Promise<void>;
+}) {
+  return (
+    <section className="listSection">
+      <div className="sectionHeader">
+        <div>
+          <p className="eyebrow">Approvals</p>
+          <h2>Requests awaiting my approval</h2>
+        </div>
+      </div>
+      <div className="taskBoardGrid">
+        {requests.map((req) => (
+          <ApprovalRequestCard key={req.id} req={req} token={token} onChanged={onChanged} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function MyRequestCard({
+  req,
+  token,
+  onChanged,
+}: {
+  req: TaskAssignmentRequest;
+  token: string;
+  onChanged: () => Promise<void>;
+}) {
+  const [isBusy, setIsBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  async function cancel() {
+    try {
+      setIsBusy(true);
+      setError('');
+      await cancelTaskRequest(req.id, token);
+      await onChanged();
+    } catch (cancelError) {
+      setError(parseApiError(cancelError).detail || 'Could not cancel this request.');
+      setIsBusy(false);
+    }
+  }
+
+  return (
+    <article className="taskBoardCard">
+      <div className="taskTopRow">
+        <strong>{req.title}</strong>
+        <span className={`status status-req-${req.status}`}>{REQUEST_STATUS_LABELS[req.status]}</span>
+      </div>
+      <p className="metaText">For: {personLabel(req.target)}</p>
+      {req.status === 'pending' ? (
+        <p className="metaText">
+          {req.current_approver
+            ? `Awaiting approval from ${req.current_approver.username}.`
+            : 'Awaiting approval.'}
+        </p>
+      ) : null}
+      {req.status === 'approved' ? (
+        <p className="metaText">Approved — task assigned to {personLabel(req.target)}.</p>
+      ) : null}
+      {req.status === 'rejected' ? (
+        <p className="metaText">
+          Rejected{req.rejected_by ? ` by ${req.rejected_by.username}` : ''}
+          {req.rejection_reason ? ` — ${req.rejection_reason}` : ''}.
+        </p>
+      ) : null}
+
+      {req.status === 'pending' ? (
+        <div className="modalActionRow">
+          <button type="button" className="ghostButton" onClick={() => void cancel()} disabled={isBusy}>
+            {isBusy ? 'Cancelling…' : 'Cancel request'}
+          </button>
+        </div>
+      ) : null}
+      {error ? <p className="errorText">{error}</p> : null}
+    </article>
+  );
+}
+
+function MyRequestsBoard({
+  requests,
+  token,
+  onChanged,
+}: {
+  requests: TaskAssignmentRequest[];
+  token: string;
+  onChanged: () => Promise<void>;
+}) {
+  return (
+    <section className="listSection">
+      <div className="sectionHeader">
+        <div>
+          <p className="eyebrow">My Requests</p>
+          <h2>Upward requests I&apos;ve sent</h2>
+        </div>
+      </div>
+      <div className="taskBoardGrid">
+        {requests.map((req) => (
+          <MyRequestCard key={req.id} req={req} token={token} onChanged={onChanged} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
 export function ClientPage() {
   const [authMode, setAuthMode] = useState<AuthMode>('login');
   const [formState, setFormState] = useState<AuthFormState>(initialFormState);
@@ -1325,6 +1840,8 @@ export function ClientPage() {
   const [pendingReviewPrompts, setPendingReviewPrompts] = useState<ReviewPrompt[]>([]);
   const [isClarificationDismissed, setIsClarificationDismissed] = useState(false);
   const [isAccountOpen, setIsAccountOpen] = useState(false);
+  const [awaitingRequests, setAwaitingRequests] = useState<TaskAssignmentRequest[]>([]);
+  const [myRequests, setMyRequests] = useState<TaskAssignmentRequest[]>([]);
 
   useEffect(() => {
     const storedToken = window.localStorage.getItem(TOKEN_KEY);
@@ -1343,12 +1860,15 @@ export function ClientPage() {
         setDashboard(dashboardData);
         setPendingReviewPrompts(createReviewPrompts(dashboardData.my_voice_messages));
         setIsClarificationDismissed(false);
+        await refreshRequests(activeToken);
       } catch {
         window.localStorage.removeItem(TOKEN_KEY);
         setToken('');
         setUser(null);
         setDashboard(null);
         setPendingReviewPrompts([]);
+        setAwaitingRequests([]);
+        setMyRequests([]);
       } finally {
         setIsLoading(false);
       }
@@ -1357,12 +1877,26 @@ export function ClientPage() {
     void loadSession();
   }, []);
 
+  async function refreshRequests(activeToken: string) {
+    try {
+      const [awaiting, mine] = await Promise.all([
+        getRequestsAwaitingMe(activeToken),
+        getMyTaskRequests(activeToken),
+      ]);
+      setAwaitingRequests(awaiting.requests);
+      setMyRequests(mine.requests);
+    } catch {
+      // Non-fatal: keep whatever lists we already have.
+    }
+  }
+
   async function refreshDashboard(activeToken: string) {
     const dashboardData = await getDashboard(activeToken);
     setDashboard(dashboardData);
     setUser(dashboardData.user);
     setPendingReviewPrompts(createReviewPrompts(dashboardData.my_voice_messages));
     setIsClarificationDismissed(false);
+    await refreshRequests(activeToken);
   }
 
   function updateField(field: keyof AuthFormState, value: string) {
@@ -1664,9 +2198,24 @@ export function ClientPage() {
               </>
             )}
           </div>
+
+          {dashboard.superiors.length > 0 ? (
+            <UpwardRequestForm
+              superiors={dashboard.superiors}
+              token={token}
+              onChanged={handleTaskChanged}
+            />
+          ) : null}
         </section>
 
         <TaskBoard tasks={dashboard.assigned_tasks} token={token} onChanged={handleTaskChanged} />
+        {awaitingRequests.length > 0 ? (
+          <ApprovalRequestsBoard
+            requests={awaitingRequests}
+            token={token}
+            onChanged={handleTaskChanged}
+          />
+        ) : null}
         {dashboard.team_tasks.length > 0 ? (
           <TeamTasksBoard
             tasks={dashboard.team_tasks}
@@ -1674,6 +2223,9 @@ export function ClientPage() {
             availableUsers={dashboard.available_users}
             onChanged={handleTaskChanged}
           />
+        ) : null}
+        {myRequests.length > 0 ? (
+          <MyRequestsBoard requests={myRequests} token={token} onChanged={handleTaskChanged} />
         ) : null}
         <TranscriptList
           transcripts={dashboard.my_voice_messages}

@@ -83,6 +83,44 @@ def get_superiors(user) -> list[User]:
     return result
 
 
+def get_approver_chain(requester, target) -> list[User]:
+    """Ordered intermediate approvers strictly between `requester` and `target`.
+
+    Walks `requester`'s actual manager chain upward (direct manager first). Every user
+    encountered BEFORE `target` is an intermediate approver, returned bottom-up (closest
+    to the requester first). `target` itself is never included.
+
+    Ancestry is determined solely by the manager chain — never by role rank (a senior in a
+    different branch outranks an employee but is not their ancestor). Raises ValueError if
+    `target` is not a strict ancestor of `requester` (peer, subordinate, or different branch),
+    or for an invalid requester/target. Returns an empty list when `target` is the
+    requester's direct manager (no intermediates).
+    """
+    if requester is None or target is None or requester.id == target.id:
+        raise ValueError('Invalid requester or target for an upward task request.')
+
+    chain: list[User] = []
+    seen: set[int] = set()
+    profile = get_profile(requester)
+    while profile is not None and profile.manager_id:
+        manager_id = profile.manager_id
+        if manager_id == target.id:
+            # Reached the target; everyone collected so far is strictly between.
+            return chain
+        if manager_id in seen:
+            break  # cycle guard
+        seen.add(manager_id)
+        manager = User.objects.filter(id=manager_id).select_related('profile').first()
+        if manager is None:
+            break
+        chain.append(manager)
+        profile = get_profile(manager)
+
+    raise ValueError(
+        'You can only request a task for someone directly above you in your chain of command.'
+    )
+
+
 def can_assign(actor, target) -> bool:
     """Can `actor` assign a task to `target`?"""
     if actor is None or target is None or actor.id == target.id:

@@ -306,18 +306,27 @@ export async function updateAccount(
   return result.user;
 }
 
+export type TaskRouting = {
+  assigned_down: string[];
+  upward_requests: { target: string; current_approver: string | null; title: string }[];
+  unidentified: string[];
+  unroutable: string[];
+};
+
+export type UploadResult = Transcript & { routing?: TaskRouting };
+
 export function uploadAudio(
   file: File,
   token: string,
   language: '' | 'ar' | 'en' = ''
-): Promise<Transcript> {
+): Promise<UploadResult> {
   const formData = new FormData();
   formData.append('file', file);
   if (language) {
     formData.append('language', language);
   }
 
-  return request<Transcript>(
+  return request<UploadResult>(
     '/transcriptions/',
     {
       method: 'POST',
@@ -481,6 +490,124 @@ export function deleteUser(
       method: 'POST',
       body: JSON.stringify(payload),
     },
+    token
+  );
+}
+
+// --- Upward task-assignment requests (approved up the chain of command) ---
+
+export type TaskRequestStatus = 'pending' | 'approved' | 'rejected' | 'cancelled';
+
+export type TaskAssignmentRequest = {
+  id: number;
+  requester: User;
+  target: User;
+  title: string;
+  description: string;
+  priority: 'low' | 'medium' | 'high';
+  priority_display: string;
+  due_date: string | null;
+  status: TaskRequestStatus;
+  status_display: string;
+  current_approver: User | null;
+  rejection_reason: string;
+  rejected_by: User | null;
+  created_task: number | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export function createTaskRequest(
+  payload: {
+    target_username: string;
+    title: string;
+    description?: string;
+    priority?: 'low' | 'medium' | 'high';
+    due_date?: string | null;
+  },
+  token: string
+): Promise<{ request: TaskAssignmentRequest }> {
+  return request<{ request: TaskAssignmentRequest }>(
+    '/task-requests/',
+    {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    },
+    token
+  );
+}
+
+export function createTaskRequestFromAudio(
+  targetUsername: string,
+  file: File,
+  token: string,
+  language: '' | 'ar' | 'en' = ''
+): Promise<{ request: TaskAssignmentRequest; transcript: string }> {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('target_username', targetUsername);
+  if (language) {
+    formData.append('language', language);
+  }
+  return request<{ request: TaskAssignmentRequest; transcript: string }>(
+    '/task-requests/from-audio/',
+    {
+      method: 'POST',
+      body: formData,
+    },
+    token
+  );
+}
+
+export function getRequestsAwaitingMe(
+  token: string
+): Promise<{ requests: TaskAssignmentRequest[] }> {
+  return request<{ requests: TaskAssignmentRequest[] }>(
+    '/task-requests/awaiting-me/',
+    undefined,
+    token
+  );
+}
+
+export function getMyTaskRequests(
+  token: string
+): Promise<{ requests: TaskAssignmentRequest[] }> {
+  return request<{ requests: TaskAssignmentRequest[] }>('/task-requests/', undefined, token);
+}
+
+export function approveTaskRequest(
+  id: number,
+  token: string
+): Promise<{ request: TaskAssignmentRequest }> {
+  return request<{ request: TaskAssignmentRequest }>(
+    `/task-requests/${id}/approve/`,
+    { method: 'POST' },
+    token
+  );
+}
+
+export function rejectTaskRequest(
+  id: number,
+  reason: string,
+  token: string
+): Promise<{ request: TaskAssignmentRequest }> {
+  return request<{ request: TaskAssignmentRequest }>(
+    `/task-requests/${id}/reject/`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    },
+    token
+  );
+}
+
+export function cancelTaskRequest(
+  id: number,
+  token: string
+): Promise<{ request: TaskAssignmentRequest }> {
+  return request<{ request: TaskAssignmentRequest }>(
+    `/task-requests/${id}/cancel/`,
+    { method: 'POST' },
     token
   );
 }

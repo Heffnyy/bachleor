@@ -4,7 +4,7 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.mail import send_mail
 
-from .models import AccountChangeOTP, Task, TaskNote, UserProfile
+from .models import AccountChangeOTP, Task, TaskAssignmentRequest, TaskNote, UserProfile
 
 logger = logging.getLogger(__name__)
 
@@ -294,6 +294,62 @@ def send_account_otp_email(otp: AccountChangeOTP, code: str) -> bool:
         return False
 
 
+def send_account_updated_email(user: User, changed_fields: dict, password_changed: bool) -> bool:
+    """Confirm to a user that their account details changed, listing only what changed.
+
+    `changed_fields` maps field name -> new value, for any of
+    username/first_name/last_name/email that actually changed. The password is never
+    included; `password_changed` only flags that it changed. Returns True if sent.
+    """
+    if not user.email:
+        return False
+    if not changed_fields and not password_changed:
+        return False
+
+    labels = {
+        'username': 'Username',
+        'first_name': 'First name',
+        'last_name': 'Last name',
+        'email': 'Email',
+    }
+    order = ('username', 'first_name', 'last_name', 'email')
+
+    summary = [labels[f] for f in order if f in changed_fields]
+    if password_changed:
+        summary.append('Password')
+
+    lines = [
+        f'Hi {user.first_name or user.username},',
+        '',
+        'Your account details were updated.',
+        '',
+        'The following details were updated: ' + ', '.join(summary) + '.',
+        '',
+    ]
+    for field in order:
+        if field in changed_fields:
+            lines.append(f'{labels[field]}: {changed_fields[field]}')
+    if password_changed:
+        lines.append('Password was changed.')
+    lines += [
+        '',
+        "If you didn't make this change, contact an administrator right away.",
+    ]
+
+    try:
+        send_mail(
+            'Your account details were updated',
+            '\n'.join(lines),
+            settings.DEFAULT_FROM_EMAIL,
+            [user.email],
+            fail_silently=False,
+        )
+        return True
+    except Exception:
+        logger.exception('Failed to send account update email to %s', user.email)
+        return False
+
+
 def send_task_assignment_email(task: Task) -> None:
     recipient = task.assigned_to
     if recipient is None or not recipient.email:
@@ -327,3 +383,100 @@ def send_task_assignment_email(task: Task) -> None:
         )
     except Exception:
         logger.exception('Failed to send task assignment email to %s', recipient.email)
+
+
+def send_task_request_approval_needed_email(req: TaskAssignmentRequest) -> bool:
+    """Tell the current approver that an upward task request awaits their decision."""
+    approver = req.current_approver
+    if approver is None or not approver.email:
+        return False
+
+    requester_name = req.requester.get_full_name() or req.requester.username
+    target_name = req.target.get_full_name() or req.target.username
+    lines = [
+        f'Hi {approver.first_name or approver.username},',
+        '',
+        f'{requester_name} requested to assign a task up the chain of command, and it needs '
+        'your approval before it moves on.',
+        '',
+        f'Proposed task: {req.title}',
+        f'Requested by: {requester_name}',
+        f'To be assigned to: {target_name}',
+    ]
+    if req.description:
+        lines += ['', 'Details:', req.description]
+    lines += ['', f'Review it to approve or reject: {settings.FRONTEND_BASE_URL}']
+
+    try:
+        send_mail(
+            'A task request needs your approval',
+            '\n'.join(lines),
+            settings.DEFAULT_FROM_EMAIL,
+            [approver.email],
+            fail_silently=False,
+        )
+        return True
+    except Exception:
+        logger.exception('Failed to send task-request approval email to %s', approver.email)
+        return False
+
+
+def send_task_request_approved_email(req: TaskAssignmentRequest) -> bool:
+    """Tell the requester their upward request was fully approved and the task assigned."""
+    requester = req.requester
+    if not requester.email:
+        return False
+
+    target_name = req.target.get_full_name() or req.target.username
+    lines = [
+        f'Hi {requester.first_name or requester.username},',
+        '',
+        f'Your task request was fully approved. The task "{req.title}" has been assigned to '
+        f'{target_name}.',
+        '',
+        f'Log in for details: {settings.FRONTEND_BASE_URL}',
+    ]
+
+    try:
+        send_mail(
+            f'Your task request was approved: {req.title}',
+            '\n'.join(lines),
+            settings.DEFAULT_FROM_EMAIL,
+            [requester.email],
+            fail_silently=False,
+        )
+        return True
+    except Exception:
+        logger.exception('Failed to send task-request approved email to %s', requester.email)
+        return False
+
+
+def send_task_request_rejected_email(req: TaskAssignmentRequest) -> bool:
+    """Tell the requester their upward request was rejected, by whom and why."""
+    requester = req.requester
+    if not requester.email:
+        return False
+
+    rejecter = req.rejected_by
+    rejecter_name = (rejecter.get_full_name() or rejecter.username) if rejecter else 'An approver'
+    lines = [
+        f'Hi {requester.first_name or requester.username},',
+        '',
+        f'Your request to assign the task "{req.title}" was rejected by {rejecter_name}.',
+    ]
+    if req.rejection_reason:
+        lines += ['', 'Reason:', req.rejection_reason]
+    lines += ['', f'Log in for more: {settings.FRONTEND_BASE_URL}']
+
+    try:
+        send_mail(
+            f'Your task request was rejected: {req.title}',
+            '\n'.join(lines),
+            settings.DEFAULT_FROM_EMAIL,
+            [requester.email],
+            fail_silently=False,
+        )
+        return True
+    except Exception:
+        logger.exception('Failed to send task-request rejected email to %s', requester.email)
+        return False

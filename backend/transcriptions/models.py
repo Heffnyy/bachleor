@@ -7,6 +7,14 @@ from django.utils import timezone
 from django.utils.crypto import get_random_string
 
 
+class RequestPermissionError(ValueError):
+    """Raised when a user acts on a request it's not their turn/right to act on (-> HTTP 403)."""
+
+
+class RequestStateError(ValueError):
+    """Raised when a request transition isn't valid for its current status (-> HTTP 400)."""
+
+
 class UserProfile(models.Model):
     """Role, chain-of-command position, and approval state for each user."""
 
@@ -144,7 +152,15 @@ class Transcription(models.Model):
         (STATUS_FAILED, 'Failed'),
     ]
 
-    original_file = models.FileField(upload_to='audio/')
+    SOURCE_AUDIO = 'audio'
+    SOURCE_TEXT = 'text'
+    SOURCE_CHOICES = [
+        (SOURCE_AUDIO, 'Audio'),
+        (SOURCE_TEXT, 'Text'),
+    ]
+
+    # Blank for text-origin records (e.g. an approved upward task request has no audio).
+    original_file = models.FileField(upload_to='audio/', blank=True)
     original_filename = models.CharField(max_length=255)
     owner = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -153,6 +169,7 @@ class Transcription(models.Model):
         null=True,
         blank=True,
     )
+    source = models.CharField(max_length=8, choices=SOURCE_CHOICES, default=SOURCE_AUDIO)
     detected_language = models.CharField(max_length=16, blank=True)
     transcript = models.TextField(blank=True)
     duration_seconds = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
@@ -257,3 +274,167 @@ class TaskNote(models.Model):
 
     def __str__(self) -> str:
         return f'{self.get_kind_display()} on {self.task_id}'
+
+
+class TaskAssignmentRequest(models.Model):
+    """A request to assign a task UP the chain of command, approved sequentially.
+
+    `approver_chain` holds the ordered intermediate user IDs (the requester's manager,
+    then that manager's manager, ... up to but excluding the target). They approve
+    bottom-up (closest to the requester first). When the last intermediate approves, the
+    Task is created and assigned to the target. For a direct-manager request there are no
+    intermediates, so the target approves it (and becomes the assignee).
+    """
+
+    STATUS_PENDING = 'pending'
+    STATUS_APPROVED = 'approved'
+    STATUS_REJECTED = 'rejected'
+    STATUS_CANCELLED = 'cancelled'
+    STATUS_CHOICES = [
+        (STATUS_PENDING, 'Pending'),
+        (STATUS_APPROVED, 'Approved'),
+        (STATUS_REJECTED, 'Rejected'),
+        (STATUS_CANCELLED, 'Cancelled'),
+    ]
+
+    requester = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name='submitted_task_requests',
+        on_delete=models.CASCADE,
+    )
+    target = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name='incoming_task_requests',
+        on_delete=models.CASCADE,
+    )
+
+    # Proposed task fields — mirror Task so the Task can be built from them on approval.
+    title = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    priority = models.CharField(
+        max_length=16, choices=Task.PRIORITY_CHOICES, default=Task.PRIORITY_MEDIUM
+    )
+    due_date = models.DateField(null=True, blank=True)
+
+    status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    # Ordered intermediate approver user IDs (excludes the target).
+    approver_chain = models.JSONField(default=list)
+    current_approver = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name='pending_task_request_approvals',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+
+    rejection_reason = models.TextField(blank=True)
+    rejected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name='rejected_task_requests',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    created_task = models.ForeignKey(
+        Task,
+        related_name='origin_request',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self) -> str:
+        return f'Request {self.id}: {self.requester_id} -> {self.target_id} ({self.status})'
+
+    # --- transition helpers -------------------------------------------------
+    # These mutate state only; the view layer fires notifications based on what
+    # they return, so the model never imports notifications (avoids a cycle).
+
+    def _next_approver_id(self, after_user_id: int):
+        """The next approver ID after `after_user_id` in the chain, or None if that was
+        the last intermediate (or the target in the empty-chain case) → time to finalize."""
+        chain = list(self.approver_chain or [])
+        if after_user_id in chain:
+            idx = chain.index(after_user_id)
+            if idx + 1 < len(chain):
+                return chain[idx + 1]
+        return None
+
+    def _create_task(self) -> 'Task':
+        """Build the real Task assigned to the target, backed by a text-origin
+        Transcription that carries the requester's typed title/description."""
+        content = '\n\n'.join(part for part in (self.title, self.description) if part).strip()
+        transcription = Transcription.objects.create(
+            owner=self.requester,
+            original_filename='Upward task request',
+            source=Transcription.SOURCE_TEXT,
+            status=Transcription.STATUS_COMPLETED,
+            detected_language='text',
+            transcript=content,
+        )
+        return Task.objects.create(
+            transcription=transcription,
+            title=self.title,
+            description=self.description,
+            priority=self.priority,
+            due_date=self.due_date,
+            assigned_to=self.target,
+            assigned_to_name=self.target.username,
+            assigned_from=self.requester,
+            is_reviewed=True,
+        )
+
+    def approve(self, user) -> 'TaskAssignmentRequest':
+        """Current approver approves. Either advances to the next approver, or — if this
+        was the last one — creates the Task assigned to the target and marks approved.
+        Raises ValueError if it's not this user's turn or the request isn't pending."""
+        if self.status != self.STATUS_PENDING:
+            raise RequestStateError('This request is no longer pending.')
+        if self.current_approver_id != user.id:
+            raise RequestPermissionError('It is not your turn to approve this request.')
+
+        next_id = self._next_approver_id(user.id)
+        if next_id is not None:
+            self.current_approver_id = next_id
+            self.save(update_fields=['current_approver', 'updated_at'])
+            return self  # advanced; current_approver is the next person
+
+        # No one left in the chain → finalize: create the task assigned to the target.
+        task = self._create_task()
+        self.created_task = task
+        self.status = self.STATUS_APPROVED
+        self.current_approver = None
+        self.save(update_fields=['created_task', 'status', 'current_approver', 'updated_at'])
+        return self
+
+    def reject(self, user, reason: str = '') -> 'TaskAssignmentRequest':
+        """Current approver rejects → stops the whole request immediately."""
+        if self.status != self.STATUS_PENDING:
+            raise RequestStateError('This request is no longer pending.')
+        if self.current_approver_id != user.id:
+            raise RequestPermissionError('It is not your turn to act on this request.')
+        self.status = self.STATUS_REJECTED
+        self.rejection_reason = (reason or '').strip()
+        self.rejected_by = user
+        self.current_approver = None
+        self.save(
+            update_fields=['status', 'rejection_reason', 'rejected_by', 'current_approver', 'updated_at']
+        )
+        return self
+
+    def cancel(self, user) -> 'TaskAssignmentRequest':
+        """Requester cancels their own request while it is still pending."""
+        if self.status != self.STATUS_PENDING:
+            raise RequestStateError('Only a pending request can be cancelled.')
+        if self.requester_id != user.id:
+            raise RequestPermissionError('Only the requester can cancel this request.')
+        self.status = self.STATUS_CANCELLED
+        self.current_approver = None
+        self.save(update_fields=['status', 'current_approver', 'updated_at'])
+        return self

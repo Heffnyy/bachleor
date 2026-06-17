@@ -2,6 +2,7 @@ from rest_framework.routers import DefaultRouter
 from django.urls import path
 
 from .views import (
+    TaskAssignmentRequestViewSet,
     TaskViewSet,
     TranscriptionViewSet,
     account_request_otp_view,
@@ -23,6 +24,7 @@ from .views import (
 router = DefaultRouter()
 router.register('transcriptions', TranscriptionViewSet, basename='transcription')
 router.register('tasks', TaskViewSet, basename='task')
+router.register('task-requests', TaskAssignmentRequestViewSet, basename='task-request')
 
 urlpatterns = [
     path('auth/register/', register_view),

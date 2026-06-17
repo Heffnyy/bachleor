@@ -1,6 +1,6 @@
 from django.contrib.auth.models import User
 from rest_framework import serializers
-from .models import Task, TaskNote, Transcription, UserProfile
+from .models import Task, TaskAssignmentRequest, TaskNote, Transcription, UserProfile
 
 
 class BasicUserSerializer(serializers.ModelSerializer):
@@ -72,6 +72,49 @@ class TaskSerializer(serializers.ModelSerializer):
 
 class TaskStatusSerializer(serializers.Serializer):
     status = serializers.ChoiceField(choices=Task.STATUS_CHOICES)
+
+
+class TaskAssignmentRequestSerializer(serializers.ModelSerializer):
+    requester = BasicUserSerializer(read_only=True)
+    target = BasicUserSerializer(read_only=True)
+    current_approver = BasicUserSerializer(read_only=True)
+    rejected_by = BasicUserSerializer(read_only=True)
+    priority_display = serializers.CharField(source='get_priority_display', read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    created_task = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = TaskAssignmentRequest
+        fields = [
+            'id',
+            'requester',
+            'target',
+            'title',
+            'description',
+            'priority',
+            'priority_display',
+            'due_date',
+            'status',
+            'status_display',
+            'current_approver',
+            'rejection_reason',
+            'rejected_by',
+            'created_task',
+            'created_at',
+            'updated_at',
+        ]
+
+
+class TaskAssignmentRequestCreateSerializer(serializers.Serializer):
+    target_username = serializers.CharField(max_length=150)
+    title = serializers.CharField(max_length=255)
+    description = serializers.CharField(required=False, allow_blank=True)
+    priority = serializers.ChoiceField(choices=Task.PRIORITY_CHOICES, default=Task.PRIORITY_MEDIUM)
+    due_date = serializers.DateField(required=False, allow_null=True)
+
+
+class TaskRequestRejectSerializer(serializers.Serializer):
+    reason = serializers.CharField(required=False, allow_blank=True)
 
 
 class TaskNoteCreateSerializer(serializers.Serializer):
