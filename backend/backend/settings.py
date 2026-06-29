@@ -71,11 +71,15 @@ if DATABASE_URL:
     # Railway's public Postgres URL requires SSL; the private-network URL
     # (*.railway.internal) does not. Default to requiring SSL, overridable.
     DATABASE_SSL_REQUIRE = os.getenv('DATABASE_SSL_REQUIRE', 'true').lower() == 'true'
+    # Supabase poolers have a small client cap (session mode = 15). Don't hold
+    # connections open (conn_max_age=0 closes after each request, freeing pool slots),
+    # and disable server-side cursors so the transaction pooler (port 6543) works.
     DATABASES = {
         'default': dj_database_url.parse(
             DATABASE_URL,
-            conn_max_age=600,
+            conn_max_age=int(os.getenv('DB_CONN_MAX_AGE', '0')),
             ssl_require=DATABASE_SSL_REQUIRE,
+            disable_server_side_cursors=True,
         ),
     }
 else:
